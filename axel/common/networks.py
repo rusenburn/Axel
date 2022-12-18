@@ -33,7 +33,6 @@ class PytorchNetwork(nn.Module, NetworkBase):
             self.last_path = path
         try:
             T.save(self.state_dict(), path)
-            print(f'could not save nn to {self.last_path}')
         except:
             print(f'could not save nn to {self.last_path}')
 
@@ -92,3 +91,31 @@ class CriticNetwork(PytorchNetwork):
     def forward(self, observation: T.Tensor) -> T.Tensor:
         v: T.Tensor = self._v(observation)
         return v
+
+
+class ActorCriticNetwork(PytorchNetwork):
+    def __init__(self, observation_space: np.ndarray, n_actions: int) -> None:
+        super().__init__()
+        self._shared = nn.Sequential(
+            nn.Conv2d(observation_space[0], 32, 8, 4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 4, 2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, 3, 1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(64*7*7, 512),
+            nn.ReLU()
+        )
+
+        self._probs = nn.Sequential(
+            nn.Linear(512, n_actions),
+            nn.Softmax(dim=-1)
+        )
+        self._v = nn.Linear(512, 1)
+
+    def forward(self, observation: T.Tensor) -> tuple[T.Tensor, T.Tensor]:
+        shared: T.Tensor = self._shared(observation)
+        probs: T.Tensor = self._probs(shared)
+        v: T.Tensor = self._v(shared)
+        return probs, v

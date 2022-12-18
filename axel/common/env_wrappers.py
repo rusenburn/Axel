@@ -22,7 +22,7 @@ class SkipFrame(gym.Wrapper):
             total_reward += reward
             if done:
                 break
-        return obs, total_reward, done, trunk, info
+        return obs, total_reward/100, done, trunk, info
 
 
 class GrayScaleObservation(gym.ObservationWrapper):
