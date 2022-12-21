@@ -110,10 +110,6 @@ class Ppo:
                     f"Average FPS:            {self.n_workers * iteration//total_duration }")
             actor_scheduler.step()
             critic_shceduler.step()
-            # self.actor.save_model(os.path.join("tmp", "actor.pt"))
-            # self.critic.save_model(os.path.join("tmp", "critic.pt"))
-            # T.save(self.actor_optim, os.path.join("tmp", "actor_optim.pt"))
-            # T.save(self.critic_optim, os.path.join("tmp", "critic_optim.pt"))
 
     def choose_actions(self, obs: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         state: T.Tensor = T.tensor(obs, dtype=T.float32, device=self.device)
@@ -177,6 +173,7 @@ class Ppo:
                 actions_tensor: T.Tensor = T.tensor(
                     actions_arr[batch], device=self.device)
                 # Normalize advantages
+                # TODO mb you need to clone
                 normalized_advatages = advantages_tensor[batch]
                 normalized_advatages = (
                     normalized_advatages - normalized_advatages.mean())/normalized_advatages.std()

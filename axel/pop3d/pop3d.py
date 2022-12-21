@@ -3,6 +3,7 @@ import time
 import gym
 import numpy as np
 import torch as T
+import matplotlib.pyplot as plt
 from collections import deque
 from torch.nn.utils.clip_grad import clip_grad_norm_
 from axel.common.networks import ActorCriticNetwork
@@ -33,7 +34,7 @@ class Pop3d:
         self.n_game_actions = self.vec_env.single_action_space.n
 
         self.network = ActorCriticNetwork(
-            self.vec_env.single_observation_space.shape, self.n_workers)
+            self.vec_env.single_observation_space.shape, self.n_game_actions)
         self.network_optim = T.optim.Adam(
             self.network.parameters(), lr=lr, eps=1e-5)
 
@@ -58,6 +59,10 @@ class Pop3d:
         network_scheduler = T.optim.lr_scheduler.LambdaLR(
             self.network_optim, alpha_ratio)
 
+        summary_time_step = []
+        summary_duration = []
+        summary_score = []
+        summary_std = []
         for iteration in range(1, total_iterations+1):
             iteration_start = time.perf_counter()
             actions, log_probs, values = self.choose_actions(observations)
@@ -85,9 +90,11 @@ class Pop3d:
                 T.save(self.network_optim,os.path.join("tmp","network_optim.pt"))
             
             if iteration * self.n_workers % 500 == 0:
-                iteration_duration = time.perf_counter()-iteration_start
                 total_duration = time.perf_counter()-t_start
-                iteration_fps = self.n_workers // iteration_duration
+
+                score_mean = np.mean(s)
+                score_std = np.std(s)
+                score_err = 1.95 * score_std/(len(s)**0.5)
 
                 print(f"**************************************************")
                 print(
@@ -97,16 +104,22 @@ class Pop3d:
                 print(
                     f"Total Steps:            {self.n_workers*iteration} of {int(self.total_steps)}")
                 print(
-                    f"Average Score:          {np.mean(s) if len(s)>0 else 0:0.2f}")
-                print(
-                    f"Iteration duration:     {iteration_duration:0.2f} seconds")
-                print(f"Iteration FPS:          {iteration_fps}")
+                    f"Average Score:          {score_mean} ± {score_err}")
                 print(f"Total duration:         {total_duration:0.2f} seconds")
                 print(
                     f"Average FPS:            {self.n_workers * iteration//total_duration }")
             
+            if iteration * self.n_workers % 1_00_000 == 0:
+                total_duration = time.perf_counter()-t_start
+                summary_time_step.append(iteration*self.n_workers)
+                summary_duration.append(int(total_duration))
+                summary_std.append(np.std(s))
+                summary_score.append(np.mean(s))
             network_scheduler.step()
-
+        
+        errs = [1.95*std/len(summary_std)**0.5 for std in summary_std]
+        self.plot_summary(summary_time_step,summary_score,errs,"Time Step" , "Score Last 100 games" , "Score-Step")
+        self.plot_summary(summary_duration,summary_score,errs,"duration in seconds" , "Score Last 100 games","Score-duration")
 
     def choose_actions(self, observations: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         observation_tensor = T.tensor(
@@ -123,12 +136,12 @@ class Pop3d:
 
     def train_network(self,last_values:np.ndarray):
         # self.network.train
+
+        observation_batches ,action_batches,log_prob_batches,value_batches,reward_batches,terminal_batches = self.memory_buffer.sample()
+        advantages_tensor:T.Tensor = self._calculate_advantages(reward_batches,value_batches,terminal_batches,last_values)
+
         batch_size = (self.step_size * self.n_workers) // self.n_batches
         for epoch in range(self.n_epochs):
-            observation_batches ,action_batches,log_prob_batches,value_batches,reward_batches,terminal_batches = self.memory_buffer.sample()
-
-            advantages_tensor:T.Tensor = self._calculate_advantages(reward_batches,value_batches,terminal_batches,last_values)
-
             batch_starts = np.arange(0,self.n_workers*self.step_size,batch_size)
             indices = np.arange(self.n_workers*self.step_size)
             np.random.shuffle(indices)
@@ -200,3 +213,11 @@ class Pop3d:
             adv_arr.flatten(), dtype=T.float32, device=self.device)
 
         return advantages
+
+    def plot_summary(self,x:list,y:list,err:list,xlabel:str,ylabel:str,file_name:str):
+        fig , ax = plt.subplots()
+        ax.errorbar(x,y,yerr=err,linewidth=2.0)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        fig.savefig(os.path.join("tmp",file_name))
+
