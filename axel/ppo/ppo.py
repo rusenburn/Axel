@@ -1,8 +1,9 @@
 import time
-import numpy as np
-import torch as T
 import gym.vector
 import os
+import numpy as np
+import torch as T
+import matplotlib.pyplot as plt
 from collections import deque
 from torch.optim import Adam
 from torch.distributions import Categorical
@@ -16,18 +17,20 @@ class Ppo:
                  total_steps=1e5,
                  step_size=5, n_batches=4, n_epochs=4,
                  gamma=0.99, gae_lam=0.95, policy_clip=0.2,
-                 lr=2.5e-4) -> None:
+                 lr=2.5e-4,enable_lr_decay=True) -> None:
         self.vec_env = vec_env
         self.n_workers = vec_env.num_envs
         assert (self.n_workers*step_size) % n_batches == 0
-        self.total_steps = total_steps
-        self.step_size = step_size
-        self.n_batches = n_batches
-        self.n_epochs = n_epochs
+
+        self.total_steps = int(total_steps)  # incase user gave float or str
+        self.step_size = int(step_size)
+        self.n_batches = int(n_batches)
+        self.n_epochs = int(n_epochs)
         self.gamma = gamma
         self.gae_lam = gae_lam
         self.policy_clip = policy_clip
         self.lr = lr
+        self.enable_lr_decay = enable_lr_decay
         self.memory_buffer = MemoryBuffer(
             self.vec_env.single_observation_space.shape, self.vec_env.num_envs, self.step_size)
 
@@ -55,12 +58,20 @@ class Ppo:
         s = deque([], 100)
 
         total_iterations = int(self.total_steps//self.n_workers)
-        def lr_fn(x): return (total_iterations-x) / total_iterations
 
+        if self.enable_lr_decay:
+            def lr_fn(x: int): return (total_iterations-x) / total_iterations
+        else:
+            def lr_fn(x: int): return 1.0
         actor_scheduler = T.optim.lr_scheduler.LambdaLR(
             self.actor_optim, lr_fn)
         critic_shceduler = T.optim.lr_scheduler.LambdaLR(
             self.critic_optim, lr_fn)
+        
+        summary_time_step = []
+        summary_duration = []
+        summary_score = []
+        summary_err = []
         for iteration in range(1, int(self.total_steps//self.n_workers)+1):
             iteration_start = time.perf_counter()
             actions, log_probs, values = self.choose_actions(observations)
@@ -87,29 +98,33 @@ class Ppo:
                 T.save(self.critic_optim, os.path.join(
                     "tmp", "critic_optim.pt"))
 
-            if (iteration * self.n_workers) % 500 == 0:
-                # TODO LOG
-                iteration_duration = time.perf_counter()-iteration_start
+            if iteration*self.n_workers % 500 < self.n_workers:
                 total_duration = time.perf_counter()-t_start
-                iteration_fps = self.n_workers // iteration_duration
-
+                steps_done = self.n_workers * iteration
+                fps = steps_done // total_duration
+                score_mean = np.mean(s) if len(s) > 0 else 0
+                score_std = np.std(s) if len(s) > 0 else 0
+                score_err = 1.95 * score_std / \
+                    (len(s)**0.5) if len(s) > 0 else 0
                 print(f"**************************************************")
+                print(f"Iteration:      {iteration} of {total_iterations}")
+                print(f"Learning rate:  {actor_scheduler.get_last_lr()}")
                 print(
-                    f"Iteration:              {iteration} of {int(self.total_steps//self.n_workers)}")
-                print(
-                    f"learning rate:          {actor_scheduler.get_last_lr()}")
-                print(
-                    f"Total Steps:            {self.n_workers*iteration} of {int(self.total_steps)}")
-                print(
-                    f"Average Score:          {np.mean(s) if len(s)>0 else 0:0.2f}")
-                print(
-                    f"Iteration duration:     {iteration_duration:0.2f} seconds")
-                print(f"Iteration FPS:          {iteration_fps}")
-                print(f"Total duration:         {total_duration:0.2f} seconds")
-                print(
-                    f"Average FPS:            {self.n_workers * iteration//total_duration }")
+                    f"Total Steps:    {steps_done} of {int(self.total_steps)}")
+                print(f"Total duration: {total_duration:0.2f} seconds")
+                print(f"Average Score:  {score_mean:0.2f} ± {score_err:0.2f}")
+                print(f"Average FPS:    {fps}")
+
+                summary_duration.append(total_duration)
+                summary_time_step.append(steps_done)
+                summary_score.append(score_mean)
+                summary_err.append(score_err)
+
             actor_scheduler.step()
             critic_shceduler.step()
+        
+        self.plot_summary(summary_time_step,summary_score,summary_err,"Steps","Score","Step-Score.png")
+        self.plot_summary(summary_duration,summary_score,summary_err,"Steps","Score","Duration-Score.png")
 
     def choose_actions(self, obs: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         state: T.Tensor = T.tensor(obs, dtype=T.float32, device=self.device)
@@ -128,24 +143,6 @@ class Ppo:
         for epoch in range(self.n_epochs):
             state_batches, action_batches, log_prob_batches, \
                 value_batches, reward_batches, terminal_batches = self.memory_buffer.sample()
-
-            # advantages_arr = np.zeros(
-            #     (self.n_workers, self.step_size), dtype=np.float32)
-            # for worker in range(self.n_workers):
-            #     for step in range(self.step_size-1):
-            #         discount = 1
-            #         a_t = 0
-            #         for k in range(step, self.step_size-1):
-            #             current_reward = reward_batches[worker][k]
-            #             current_val = value_batches[worker][k]
-            #             next_val = value_batches[worker][k+1]
-
-            #             a_t += discount*(current_reward+self.gamma*next_val *
-            #                              (1-int(terminal_batches[worker][k]))-current_val)
-            #             discount *= self.gamma*self.gae_lam
-            #         advantages_arr[worker][step] = a_t
-            # advantages_tensor = T.tensor(
-            #     advantages_arr.flatten(), dtype=T.float32, device=self.device)
 
             advantages_tensor = self._calculate_advatages(
                 reward_batches, value_batches, terminal_batches, last_values)
@@ -173,8 +170,7 @@ class Ppo:
                 actions_tensor: T.Tensor = T.tensor(
                     actions_arr[batch], device=self.device)
                 # Normalize advantages
-                # TODO mb you need to clone
-                normalized_advatages = advantages_tensor[batch]
+                normalized_advatages = advantages_tensor[batch].clone()
                 normalized_advatages = (
                     normalized_advatages - normalized_advatages.mean())/normalized_advatages.std()
 
@@ -194,7 +190,6 @@ class Ppo:
                 clipped_prob_ratio = prob_ratio.clamp(
                     1-self.policy_clip, 1+self.policy_clip)
                 weighted_clipped_probs = normalized_advatages * clipped_prob_ratio
-                # weighted_clipped_probs *= normalized_advatages
                 actor_loss = -T.min(weighted_probs,
                                     weighted_clipped_probs).mean()
 
@@ -205,7 +200,6 @@ class Ppo:
                     T.clamp(critic_values-old_values_predictions, -
                             self.policy_clip, self.policy_clip)
                 critic_loss = (returns - critic_values)**2
-                # critic_loss = 0.5*critic_loss.mean()
                 critic_loss_2 = (returns - clipped_values_predictions)**2
                 critic_loss = 0.5*T.max(critic_loss, critic_loss_2).mean()
                 total_loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
@@ -226,7 +220,6 @@ class Ppo:
         adv_arr = np.zeros(
             (self.n_workers, self.step_size+1), dtype=np.float32)
         next_val: float
-        # TODO
         for i in range(self.n_workers):
             for t in reversed(range(self.step_size)):
                 current_reward = rewards[i][t]
@@ -244,6 +237,11 @@ class Ppo:
         advantages = T.tensor(
             adv_arr.flatten(), dtype=T.float32, device=self.device)
 
-        # try normalize/standrize advantages
-        # advantages = (advantages-advantages.mean()) / (advantages.std()+1e-8)
         return advantages
+    
+    def plot_summary(self,x:list,y:list,err:list,xlabel:str,ylabel:str,file_name:str):
+        fig , ax = plt.subplots()
+        ax.errorbar(x,y,yerr=err,linewidth=2.0)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        fig.savefig(os.path.join("tmp",f"ppo-{file_name}"))

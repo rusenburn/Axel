@@ -132,8 +132,6 @@ class Ppg():
                 for ep in range(self.n_v_epochs):
                     self.train_value(observations_tensor,
                                  value_tensor + advantages_tensor,self.n_batches)
-                # buffer.append(
-                #     (observations_tensor.clone(), value_tensor.clone(), advantages_tensor.clone()))
                 buffer.append((observations_tensor.cpu().numpy(),value_tensor.cpu().numpy(),advantages_tensor.cpu().numpy()))
                 self.memory_buffer.reset()
 
@@ -166,11 +164,12 @@ class Ppg():
             fps = steps_done // total_duration
             if phase % 1 == 0:
                 print(f"*************************************")
-                print(f"Phase:         {phase} of {n_phases}")
-                print(f"learning_rate: {policy_network_scheduler.get_last_lr()}")
-                print(f"Total Steps:   {phase*steps_per_phase}")
-                print(f"Average Score: {score_mean:0.2f} ± {score_err:0.2f}")
-                print(f"Average FPS:   {int(fps)}")
+                print(f"Phase:          {phase} of {n_phases}")
+                print(f"learning_rate:  {policy_network_scheduler.get_last_lr()}")
+                print(f"Total Steps:    {phase*steps_per_phase}")
+                print(f"Total duration: {total_duration:0.2f} seconds")
+                print(f"Average Score:  {score_mean:0.2f} ± {score_err:0.2f}")
+                print(f"Average FPS:    {int(fps)}")
 
             summary_duration.append(total_duration)
             summary_time_step.append(phase*steps_per_phase)

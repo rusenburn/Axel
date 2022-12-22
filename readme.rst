@@ -26,20 +26,20 @@ Getting started
 Content
 =======
 
-**P**roximal **P**olicy **O**ptimization (`PPO <https://arxiv.org/abs/1707.06347>`)
+Proximal Policy Optimization (`PPO <https://arxiv.org/abs/1707.06347>`_)
 ----------------------------------------
 
-ppo `have some of the benefits of trust region policy optimization (TRPO), but they are much simpler to implement, more general, and have better sample complexity.`
+ppo have some of the benefits of trust region policy optimization (TRPO), but they are much simpler to implement, more general, and have better sample complexity.
 
-**P**olicy **O**ptimization with **P**enalized **P**oint **P**robability **D**istance (`POP3D <https://arxiv.org/abs/1807.00442>`)
+Policy Optimization with Penalized Point Probability Distance (`POP3D <https://arxiv.org/abs/1807.00442>_`)
 -----------------------------------------
 
-POP3D `which is a lower bound to the square of total variance divergence is proposed as another powerful variant of TRPO, Simulation results show that POP3D is highly competitive compared with PPO.`.
+POP3D which is a lower bound to the square of total variance divergence is proposed as another powerful variant of TRPO, Simulation results show that POP3D is highly competitive compared with PPO.
 
-**P**hasic **P**olicy **G**radient (`PPG <https://arxiv.org/abs/2009.04416>`)
+Phasic Policy Gradient (`PPG <https://arxiv.org/abs/2009.04416>`_)
 -----------------------------------------
 
-PPG `a reinforcement learning framework which modifies traditional on-policy actor-critic methods by separating policy and value function training into distinct phases, PPG significantly improves sample efficiency compared to PPO`
+PPG a reinforcement learning framework which modifies traditional on-policy actor-critic methods by separating policy and value function training into distinct phases, PPG significantly improves sample efficiency compared to PPO.
 
 TODO
 ====
