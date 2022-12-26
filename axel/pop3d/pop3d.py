@@ -13,7 +13,8 @@ from ..ppo.memory_buffer import MemoryBuffer
 class Pop3d:
     def __init__(self, vec_env: gym.vector.VectorEnv,
                  total_steps=int(1e5), step_size=128, n_batches=4,
-                 n_epochs=4, gamma=0.99, gae_lam=0.95, lr=2.5e-4, beta=5) -> None:
+                 n_epochs=4, gamma=0.99, gae_lam=0.95, lr=2.5e-4, beta=5,
+                 max_grad_norm=0.5,normalize_adv=False) -> None:
 
         self.vec_env = vec_env
         self.n_workers = vec_env.num_envs
@@ -26,10 +27,12 @@ class Pop3d:
         self.gae_lam = gae_lam
         self.lr = lr
         self.beta = beta
+        self.max_grad_norm = max_grad_norm
+        self.normalize_adv = normalize_adv
 
         self.memory_buffer = MemoryBuffer(
             self.vec_env.single_observation_space.shape, self.n_workers, step_size)
-        self.max_grad_norm = 0.5
+        
         self.observation_shape = vec_env.single_observation_space.shape
         self.n_game_actions = self.vec_env.single_action_space.n
 
@@ -91,7 +94,7 @@ class Pop3d:
                 T.save(self.network_optim, os.path.join(
                     "tmp", "network_optim.pt"))
 
-            if iteration * self.n_workers % 500 < self.n_workers:
+            if (iteration * self.n_workers) % 1_000 < self.n_workers:
                 total_duration = time.perf_counter()-t_start
                 steps_done = self.n_workers*iteration
 
@@ -109,7 +112,7 @@ class Pop3d:
                 print(f"Average Score:  {score_mean:0.2f} ± {score_err:0.2f}")
                 print(f"Average FPS:    {fps}")
 
-            if iteration * self.n_workers % 1_000 < self.n_workers:
+            if (iteration * self.n_workers) % 1_000 < self.n_workers:
                 total_duration = time.perf_counter()-t_start
                 steps_done = self.n_workers*iteration
                 score_mean = np.mean(s) if len(s) else 0
@@ -173,7 +176,12 @@ class Pop3d:
                     log_probs_arr[batch], dtype=T.float32, device=self.device)
                 actions_tensor = T.tensor(
                     actions_arr[batch], device=self.device)
-
+                
+                # normalized adv used in actor loss not value loss 
+                norm_or_not_adv = advantages_tensor[batch].clone()
+                if self.normalize_adv: 
+                    norm_or_not_adv -= norm_or_not_adv.mean()
+                    norm_or_not_adv /= (norm_or_not_adv.std()+1e-8)
                 predicted_values: T.Tensor
                 probs: T.Tensor
                 probs, predicted_values = self.network(observation_tensor)
@@ -188,8 +196,9 @@ class Pop3d:
                 dpp = ((old_probs-predicted_probs)**2).mean()
 
                 prob_ratio = predicted_probs/old_probs
+
                 weighted_prob_ratio = (
-                    prob_ratio * advantages_tensor[batch]).mean()
+                    prob_ratio * norm_or_not_adv).mean()
 
                 actor_loss = self.beta * dpp - weighted_prob_ratio
 
@@ -210,7 +219,6 @@ class Pop3d:
         adv_arr = np.zeros(
             (self.n_workers, self.step_size+1), dtype=np.float32)
         next_val: float
-        # TODO
         for i in range(self.n_workers):
             for t in reversed(range(self.step_size)):
                 current_reward = rewards[i][t]
@@ -227,7 +235,6 @@ class Pop3d:
         adv_arr = adv_arr[:, :-1]
         advantages = T.tensor(
             adv_arr.flatten(), dtype=T.float32, device=self.device)
-
         return advantages
 
     def plot_summary(self, x: list, y: list, err: list, xlabel: str, ylabel: str, file_name: str):

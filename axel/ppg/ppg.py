@@ -7,8 +7,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from collections import deque
 from torch.nn.utils.clip_grad import clip_grad_norm_
-from ..common.networks import ActorCriticNetwork, CriticNetwork
-from ..ppo.memory_buffer import MemoryBuffer
+from ..common.networks import ActorCriticNetwork, CriticNetwork, SmallActorCriticNetwork, SmallCriticNetwork
+from .ppg_memory_buffer import PpgMemoryBuffer
 
 
 class Ppg():
@@ -25,7 +25,11 @@ class Ppg():
                  gae_lam=0.95,
                  n_batches=4,
                  clip_ratio=0.2,
-                 lr=2.5e-4
+                 lr=2.5e-4,
+                 entropy_coef=0.01,
+                 max_grad_norm=0.5,
+                 normalize_adv=True,
+                 normalize_rewards=True,
                  ) -> None:
 
         self.vec_env = vec_env
@@ -49,14 +53,22 @@ class Ppg():
         self.gae_lam = gae_lam
         self.n_batches = n_batches
         self.clip_ratio = clip_ratio
+        self.entropy_coef = entropy_coef
         # self.lr = lr
-        self.max_grad_norm = 0.5
+        self.max_grad_norm = max_grad_norm
+        self.normalize_adv = normalize_adv
+        self.normalize_rewards = normalize_rewards
 
         # networks
         self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
-        self.policy_network = ActorCriticNetwork(
+
+        if len(self.observation_shape)>2:
+            self.policy_network = ActorCriticNetwork(
             self.observation_shape, self.n_game_action)
-        self.value_network = CriticNetwork(self.observation_shape)
+            self.value_network = CriticNetwork(self.observation_shape)
+        else:
+            self.policy_network = SmallActorCriticNetwork(self.n_game_action,self.observation_shape)
+            self.value_network = SmallCriticNetwork(self.observation_shape)
         self.policy_network_optim = T.optim.Adam(
             self.policy_network.parameters(), lr=lr)
         self.value_network_optim = T.optim.Adam(
@@ -65,8 +77,11 @@ class Ppg():
         self.policy_network.to(device=self.device)
         self.value_network.to(device=self.device)
 
-        self.memory_buffer = MemoryBuffer(
-            self.observation_shape, self.n_workers, self.step_size)
+        self.memory_buffer = PpgMemoryBuffer(
+            self.observation_shape, self.n_workers, self.step_size,n_pi)
+        
+        self.rewards_mean = deque(maxlen=100)
+        self.rewards_std = deque(maxlen=100)
 
     def run(self):
         # each phase consist of n_pi iterations which consist of n_workers * step_size steps
@@ -74,7 +89,7 @@ class Ppg():
         steps_per_phase = self.n_pi * self.n_workers * self.step_size
         print(f"Steps per phase is {steps_per_phase}")
         n_phases = int(self.total_steps) // steps_per_phase
-        def lr_fn(x): return (n_phases-x) / n_phases
+        def lr_fn(x): return (n_phases-x) / (n_phases)
         policy_network_scheduler = T.optim.lr_scheduler.LambdaLR(
             self.policy_network_optim, lr_fn)
         value_network_scheduler = T.optim.lr_scheduler.LambdaLR(
@@ -90,7 +105,9 @@ class Ppg():
         summary_score = []
         summary_err = []
         for phase in range(1,n_phases+1):
-            buffer = []
+            vls = []
+            pls = []
+            ens = []
             for iteration in tqdm.tqdm(range(1,self.n_pi+1),f"Phase {phase} iterations:"):
                 last_values_ar: np.ndarray
                 for t in range(1,self.step_size+1):
@@ -98,14 +115,15 @@ class Ppg():
                         observations)
                     new_observations, rewards, dones, truncs, infos = self.vec_env.step(
                         actions)
+                    total_score += rewards
+                    for i, (d,tr) in enumerate(list(zip(dones,truncs))):
+                        if d or tr:
+                            s.append(total_score[i])
+                            rewards[i] = 0
+                            total_score[i] = 0
                     self.memory_buffer.save(
                         observations, actions, log_probs, values, rewards, dones)
                     observations = new_observations
-                    total_score += rewards
-                    for i, d in enumerate(dones):
-                        if d:
-                            s.append(total_score[i])
-                            total_score[i] = 0
                     if t == self.step_size:  # last step
                         last_values_t: T.Tensor
                         with T.no_grad():
@@ -114,6 +132,10 @@ class Ppg():
                             last_values_ar = last_values_t.cpu().numpy()
 
                 observation_sample, action_sample, log_probs_sample, value_sample, reward_sample, dones_sample = self.memory_buffer.sample()
+
+                if self.normalize_rewards:
+                    reward_sample = self._normalize_rewards(reward_sample,3)
+
                 advantages_tensor = self._calculate_advantages(
                     reward_sample, value_sample, dones_sample, last_values_ar)
 
@@ -126,50 +148,65 @@ class Ppg():
                     value_sample.reshape((self.n_workers*self.step_size,)), dtype=T.float32, device=self.device)
 
                 for ep in range(self.n_pi_epochs):
-                    self.train_policy(observations_tensor, actions_tensor,
+                    pl,en = self.train_policy(observations_tensor, actions_tensor,
                                   log_probs_tensor, advantages_tensor)
+                    pls.append(pl)
+                    ens.append(en)
                 
                 for ep in range(self.n_v_epochs):
-                    self.train_value(observations_tensor,
+                    vl= self.train_value(observations_tensor,
                                  value_tensor + advantages_tensor,self.n_batches)
-                buffer.append((observations_tensor.cpu().numpy(),value_tensor.cpu().numpy(),advantages_tensor.cpu().numpy()))
+                    vls.append(vl)
+                self.memory_buffer.append_aux_data(observations_tensor.cpu().numpy(),(value_tensor+advantages_tensor).cpu().numpy())
                 self.memory_buffer.reset()
-
-            all_obs_ar = np.concatenate([b[0] for b in buffer],axis=0 )
-            returns_ar = np.concatenate([b[1]+b[2] for b in buffer],axis=0)
-            all_obs_tensor = T.tensor(all_obs_ar,dtype=T.float32,device=self.device)
+            
+            all_obs_ar , returns_ar = self.memory_buffer.sample_aux_data()
+            n_examples = len(all_obs_ar)
             returns_tensor = T.tensor(returns_ar,dtype=T.float32,device=self.device)
-            buffer.clear()
+            all_old_probs_dist = T.zeros((n_examples,self.n_game_action),dtype=T.float32,device=self.device)
+            batch_id = 0
+            batch_size = 1024*4
+            while batch_id < len(all_obs_ar)/batch_size:
+                start = batch_id*batch_size
+                end = (batch_id+1) * batch_size
+                end = end if end < len(all_obs_ar) else len(all_obs_ar)
+                obs_batch = all_obs_ar[start:end]
+                obs_batch_tensor = T.tensor(obs_batch,dtype=T.float32,device=self.device)
+                with T.no_grad():
+                    probs:T.Tensor = self.policy_network(obs_batch_tensor)[0]
+                all_old_probs_dist[start:end].copy_(probs.detach())
+                batch_id+=1
             assert returns_tensor.device == self.device
-            old_probs_tensor: T.Tensor
-            with T.no_grad():
-                old_probs_tensor, _ = self.policy_network(all_obs_tensor)
-                old_probs_tensor = old_probs_tensor.detach()
             for ep in range(self.n_aux_epochs):
-                self.train_aux(all_obs_tensor,old_probs_tensor, returns_tensor)
+                self.train_aux(all_obs_ar,all_old_probs_dist, returns_tensor)
+            self.memory_buffer.reset_aux_data()
             policy_network_scheduler.step()
             value_network_scheduler.step()
             if T.cuda.is_available():
                 T.cuda.empty_cache()
-
             if phase % 1 == 0:
                 self.policy_network.save_model(os.path.join("tmp","ppg_policy.pt"))
                 self.value_network.save_model(os.path.join("tmp","ppg_value.pt"))
-            score_mean = np.mean(s)
-            score_std = np.std(s)
-            score_err = 1.95 * score_std / (len(s)**0.5)
+            score_mean = np.mean(s) if len(s) else 0
+            score_std = np.std(s) if len(s) else 0
+            score_err = (1.95 * score_std / (len(s)**0.5)) if len(s) else 0
             steps_done = phase * steps_per_phase
             total_duration = time.perf_counter()-t_start
-            
+            value_loss = np.mean(vls)
+            policy_loss = np.mean(pls)
+            entropy = np.mean(ens)
             fps = steps_done // total_duration
             if phase % 1 == 0:
                 print(f"*************************************")
                 print(f"Phase:          {phase} of {n_phases}")
-                print(f"learning_rate:  {policy_network_scheduler.get_last_lr()}")
-                print(f"Total Steps:    {phase*steps_per_phase}")
+                print(f"learning_rate:  {policy_network_scheduler.get_last_lr()[0]:0.2e}")
+                print(f"Total Steps:    {phase*steps_per_phase} of {self.total_steps}")
                 print(f"Total duration: {total_duration:0.2f} seconds")
                 print(f"Average Score:  {score_mean:0.2f} ± {score_err:0.2f}")
                 print(f"Average FPS:    {int(fps)}")
+                print(f"Value Loss:     {value_loss:0.3f}")
+                print(f"Policy Loss:    {policy_loss:0.2e}")
+                print(f"Entropy:        {entropy:0.3f}")
 
             summary_duration.append(total_duration)
             summary_time_step.append(phase*steps_per_phase)
@@ -178,7 +215,7 @@ class Ppg():
         
 
         self.plot_summary(summary_time_step,summary_score,summary_err,"Steps","Score","Step-Score.png")
-        self.plot_summary(summary_duration,summary_score,summary_err,"Steps","Score","Duration-Score.png")
+        self.plot_summary(summary_duration,summary_score,summary_err,"Duration in seconds","Score","Duration-Score.png")
 
     def choose_actions(self,observation: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         observation_tensor :T.Tensor = T.tensor(observation,dtype=T.float32,device=self.device)
@@ -195,20 +232,22 @@ class Ppg():
 
     def train_policy(self, observation: T.Tensor, actions: T.Tensor, log_probs: T.Tensor, advantages: T.Tensor):
         batch_size = (self.step_size*self.n_workers) // self.n_batches
-        normalize_adv = True
     
         batch_starts = np.arange(0, self.n_workers*self.step_size,batch_size)
         indices = np.arange(self.n_workers*self.step_size)
         np.random.shuffle(indices)
         batches = [indices[i:i+batch_size] for i in batch_starts]
-
-        for batch in batches:
+        if self.normalize_adv:
+                advantages = (advantages - advantages.mean()) / (advantages.std()+1e-8)
+        entropy_losses = T.zeros((self.n_batches,),dtype=T.float32,device=self.device)
+        policy_losses = T.zeros((self.n_batches,),dtype=T.float32,device=self.device)
+        for i,batch in enumerate(batches):
             observation_batch = observation[batch]
             old_log_probs_batch = log_probs[batch]
             actions_batch = actions[batch]
             advantages_batch = advantages[batch].clone()
-            if normalize_adv:
-                advantages_batch = (advantages_batch - advantages_batch.mean()) / advantages_batch.std()
+            # if self.normalize_adv:
+            #     advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std()+1e-8)
             
             predicted_probs:T.Tensor
             predicted_probs , _ = self.policy_network(observation_batch)
@@ -222,7 +261,7 @@ class Ppg():
 
 
             lclip = -T.min(weighted_probs,weighted_clipped_probs).mean()
-            loss = lclip - 0.01*entropy
+            loss = lclip - self.entropy_coef*entropy
 
             self.policy_network.zero_grad()
             loss.backward()
@@ -231,32 +270,47 @@ class Ppg():
                 clip_grad_norm_(self.policy_network.parameters(),max_norm=self.max_grad_norm)
 
             self.policy_network_optim.step()
+            policy_losses[i] = lclip
+            entropy_losses[i] = entropy
 
-    def train_value(self,observations:T.Tensor,returns:T.Tensor,n_batches:int):
+        with T.no_grad():
+            policy_loss = policy_losses.mean().cpu().item()
+            entropy_loss = entropy_losses.mean().cpu().item()
+        return policy_loss,entropy_loss
+
+    def train_value(self,observations:T.Tensor|np.ndarray,returns:T.Tensor,n_batches:int):
         size = observations.shape[0]
         batch_size = size // n_batches
         batch_starts = np.arange(0, size,batch_size)
         indices = np.arange(size)
         np.random.shuffle(indices)
         batches = [indices[i:i+batch_size] for i in batch_starts]
-
-        for batch in batches:
-            observations_batch = observations[batch]
+        losses = T.zeros((n_batches,),dtype=T.float32,device=self.device)
+        for i,batch in enumerate(batches):
+            observations_batch:T.Tensor|np.ndarray = observations[batch]
+            if not isinstance(observations_batch,T.Tensor):
+                observations_batch = T.tensor(observations_batch,dtype=T.float32,device=self.device)
             predicted_values:T.Tensor = self.value_network(observations_batch)
             returns_batch :T.Tensor = returns[batch]
             predicted_values = predicted_values.squeeze()
 
             value_loss = 0.5 * (returns_batch - predicted_values )**2
             value_loss = value_loss.mean()
-
+            
             self.value_network_optim.zero_grad()
             value_loss.backward()
-
             if self.max_grad_norm:
                 clip_grad_norm_(self.value_network.parameters(),max_norm=self.max_grad_norm)
             self.value_network_optim.step()
+            losses[i]=value_loss
+        
+        with T.no_grad():
+            l = losses.mean().cpu().item()
+        return l
+        
+        
 
-    def train_aux(self,observations:T.Tensor,old_probs:T.Tensor,returns:T.Tensor):
+    def train_aux(self,observations:np.ndarray,old_probs:T.Tensor,returns:T.Tensor):
         size = observations.shape[0]
         n_batches = self.n_aux_batches
         batch_size = size // n_batches
@@ -269,9 +323,9 @@ class Ppg():
         # Optimize Ljoint wrt theta_pi, on all data in buffer    
         for batch in batches:
             old_probs_batch = old_probs[batch]
-            observations_batch = observations[batch]
+            observations_batch_ar = observations[batch]
             returns_batch = returns[batch]
-
+            observations_batch = T.tensor(observations_batch_ar,dtype=T.float32,device=self.device)
             predicted_policy_values:T.Tensor
             new_probs: T.Tensor
             new_probs,predicted_policy_values = self.policy_network(observations_batch)
@@ -317,6 +371,38 @@ class Ppg():
 
         return advantages
 
+
+    def _normalize_rewards(self,rewards:np.ndarray,max_norm=10)->np.ndarray:
+        # normalize rewards by dividing rewards by their standard deviation and clip any  value not in range (-max_norm,max_norm)
+        flat_rewards = rewards.flatten()
+        current_rewards_std = flat_rewards.std()
+        current_rewards_mean = flat_rewards.mean()
+        self.rewards_std.append(current_rewards_std)
+        self.rewards_mean.append(current_rewards_mean)
+
+        n_size = self.n_workers*self.step_size
+        all_sums:float = 0
+        all_squared_sums:float = 0
+        all_counts:float = 0
+        for rew_mean,rew_std in list(zip(self.rewards_mean,self.rewards_std)):
+            sum_x:float = rew_mean * n_size
+            sum_x_squared:float = (rew_std**2) * (n_size-1) + (sum_x**2) / n_size
+            all_counts+=n_size
+            all_sums += sum_x
+            all_squared_sums+=sum_x_squared
+        
+        combined_mean = all_sums/all_counts
+        combined_std = ((all_squared_sums-(all_sums**2)/all_counts)/(all_counts-1))**0.5
+        combined_err = combined_std / (all_counts**0.5 + 1e-8)
+
+        # rewards = np.clip(rewards/(np.mean(self.rewards_std)+1e-8),-max_norm,max_norm)
+        # rewards = np.clip(rewards/(max(1,flat_rewards.std())),-max_norm,max_norm)
+        # rewards = np.clip(rewards/(flat_rewards.std()+1e-8),-max_norm,max_norm)
+        
+        rewards_1 = np.clip((rewards - combined_mean-combined_err)/(combined_std+1e-8),-max_norm,max_norm)
+        rewards_2 = np.clip((rewards - combined_mean+combined_err)/(combined_std+1e-8),-max_norm,max_norm)
+        rewards = rewards_1*0.5 + rewards_2*0.5
+        return rewards
     def plot_summary(self,x:list,y:list,err:list,xlabel:str,ylabel:str,file_name:str):
         fig , ax = plt.subplots()
         ax.errorbar(x,y,yerr=err,linewidth=2.0)

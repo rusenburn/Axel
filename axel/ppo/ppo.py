@@ -13,11 +13,20 @@ from ..common.networks import NetworkBase, ActorNetwork, CriticNetwork
 
 
 class Ppo:
-    def __init__(self, vec_env: gym.vector.VectorEnv,
+    def __init__(self,
+                 vec_env: gym.vector.VectorEnv,
                  total_steps=1e5,
-                 step_size=5, n_batches=4, n_epochs=4,
-                 gamma=0.99, gae_lam=0.95, policy_clip=0.2,
-                 lr=2.5e-4,enable_lr_decay=True) -> None:
+                 step_size=5,
+                 n_batches=4,
+                 n_epochs=4,
+                 gamma=0.99,
+                 gae_lam=0.95,
+                 policy_clip=0.2,
+                 lr=2.5e-4,
+                 max_grad_norm=0.5,
+                 normalize_adv=True,
+                 enable_lr_decay=True) -> None:
+
         self.vec_env = vec_env
         self.n_workers = vec_env.num_envs
         assert (self.n_workers*step_size) % n_batches == 0
@@ -30,6 +39,8 @@ class Ppo:
         self.gae_lam = gae_lam
         self.policy_clip = policy_clip
         self.lr = lr
+        self.max_grad_norm = max_grad_norm
+        self.normalize_adv = normalize_adv
         self.enable_lr_decay = enable_lr_decay
         self.memory_buffer = MemoryBuffer(
             self.vec_env.single_observation_space.shape, self.vec_env.num_envs, self.step_size)
@@ -67,7 +78,7 @@ class Ppo:
             self.actor_optim, lr_fn)
         critic_shceduler = T.optim.lr_scheduler.LambdaLR(
             self.critic_optim, lr_fn)
-        
+
         summary_time_step = []
         summary_duration = []
         summary_score = []
@@ -122,9 +133,11 @@ class Ppo:
 
             actor_scheduler.step()
             critic_shceduler.step()
-        
-        self.plot_summary(summary_time_step,summary_score,summary_err,"Steps","Score","Step-Score.png")
-        self.plot_summary(summary_duration,summary_score,summary_err,"Steps","Score","Duration-Score.png")
+
+        self.plot_summary(summary_time_step, summary_score,
+                          summary_err, "Steps", "Score", "Step-Score.png")
+        self.plot_summary(summary_duration, summary_score,
+                          summary_err, "Steps", "Score", "Duration-Score.png")
 
     def choose_actions(self, obs: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         state: T.Tensor = T.tensor(obs, dtype=T.float32, device=self.device)
@@ -171,8 +184,9 @@ class Ppo:
                     actions_arr[batch], device=self.device)
                 # Normalize advantages
                 normalized_advatages = advantages_tensor[batch].clone()
-                normalized_advatages = (
-                    normalized_advatages - normalized_advatages.mean())/normalized_advatages.std()
+                if self.normalize_adv:
+                    normalized_advatages = (
+                        normalized_advatages - normalized_advatages.mean())/(normalized_advatages.std()+1e-8)
 
                 # get predictions for current batch of states
                 probs: T.Tensor = self.actor(states_tensor)
@@ -238,10 +252,10 @@ class Ppo:
             adv_arr.flatten(), dtype=T.float32, device=self.device)
 
         return advantages
-    
-    def plot_summary(self,x:list,y:list,err:list,xlabel:str,ylabel:str,file_name:str):
-        fig , ax = plt.subplots()
-        ax.errorbar(x,y,yerr=err,linewidth=2.0)
+
+    def plot_summary(self, x: list, y: list, err: list, xlabel: str, ylabel: str, file_name: str):
+        fig, ax = plt.subplots()
+        ax.errorbar(x, y, yerr=err, linewidth=2.0)
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
-        fig.savefig(os.path.join("tmp",f"ppo-{file_name}"))
+        fig.savefig(os.path.join("tmp", f"ppo-{file_name}"))

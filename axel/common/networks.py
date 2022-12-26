@@ -119,3 +119,69 @@ class ActorCriticNetwork(PytorchNetwork):
         probs: T.Tensor = self._probs(shared)
         v: T.Tensor = self._v(shared)
         return probs, v
+
+
+class SmallActorNetwork(PytorchNetwork):
+    def __init__(self, n_actions, input_dims,fc1_dims=256, fc2_dims=256):
+        super(SmallActorNetwork, self).__init__()
+
+        self.actor = nn.Sequential(
+            nn.Linear(*input_dims, fc1_dims),
+            nn.ReLU(),
+            nn.Linear(fc1_dims, fc2_dims),
+            nn.ReLU(),
+            nn.Linear(fc2_dims, n_actions),
+            nn.Softmax(dim=-1)
+        )
+
+        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
+        self.to(self.device)
+
+    def forward(self, state):
+        dist = self.actor(state)
+        return dist
+
+
+class SmallCriticNetwork(PytorchNetwork):
+    def __init__(self, input_dims, fc1_dims=256, fc2_dims=256):
+        super(SmallCriticNetwork, self).__init__()
+
+        self.critic = nn.Sequential(
+            nn.Linear(*input_dims, fc1_dims),
+            nn.ReLU(),
+            nn.Linear(fc1_dims, fc2_dims),
+            nn.ReLU(),
+            nn.Linear(fc2_dims, 1)
+        )
+        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
+        self.to(self.device)
+
+    def forward(self, state):
+        value = self.critic(state)
+        return value
+
+class SmallActorCriticNetwork(PytorchNetwork):
+    def __init__(self, n_actions, input_dims,fc1_dims=256, fc2_dims=256):
+        super(SmallActorCriticNetwork, self).__init__()
+        self.actor = nn.Sequential(
+            nn.Linear(*input_dims, fc1_dims),
+            nn.ReLU(),
+            nn.Linear(fc1_dims, fc2_dims),
+            nn.ReLU(),
+            nn.Linear(fc2_dims, n_actions),
+            nn.Softmax(dim=-1)
+        )
+        self.critic = nn.Sequential(
+            nn.Linear(*input_dims, fc1_dims),
+            nn.ReLU(),
+            nn.Linear(fc1_dims, fc2_dims),
+            nn.ReLU(),
+            nn.Linear(fc2_dims, 1)
+        )
+        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
+        self.to(self.device)
+
+    def forward(self, state)->tuple[T.Tensor,T.Tensor]:
+        dist = self.actor(state)
+        val = self.critic(state)
+        return dist,val
