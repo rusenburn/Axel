@@ -30,6 +30,8 @@ class Ppg():
                  max_grad_norm=0.5,
                  normalize_adv=True,
                  normalize_rewards=True,
+                 max_reward_norm=3,
+                 decay_lr=True
                  ) -> None:
 
         self.vec_env = vec_env
@@ -54,11 +56,12 @@ class Ppg():
         self.n_batches = n_batches
         self.clip_ratio = clip_ratio
         self.entropy_coef = entropy_coef
+        self.decay_lr = decay_lr 
         # self.lr = lr
         self.max_grad_norm = max_grad_norm
         self.normalize_adv = normalize_adv
         self.normalize_rewards = normalize_rewards
-
+        self.max_reward_norm = max_reward_norm
         # networks
         self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
 
@@ -89,7 +92,10 @@ class Ppg():
         steps_per_phase = self.n_pi * self.n_workers * self.step_size
         print(f"Steps per phase is {steps_per_phase}")
         n_phases = int(self.total_steps) // steps_per_phase
-        def lr_fn(x): return (n_phases-x) / (n_phases)
+        if self.decay_lr:
+            def lr_fn(x): return (n_phases-x) / (n_phases)
+        else:
+            def lr_fn(x): return 1
         policy_network_scheduler = T.optim.lr_scheduler.LambdaLR(
             self.policy_network_optim, lr_fn)
         value_network_scheduler = T.optim.lr_scheduler.LambdaLR(
@@ -105,9 +111,10 @@ class Ppg():
         summary_score = []
         summary_err = []
         for phase in range(1,n_phases+1):
-            vls = []
-            pls = []
-            ens = []
+            value_losses_info = []
+            policy_losses_info = []
+            entropies = []
+
             for iteration in tqdm.tqdm(range(1,self.n_pi+1),f"Phase {phase} iterations:"):
                 last_values_ar: np.ndarray
                 for t in range(1,self.step_size+1):
@@ -119,9 +126,10 @@ class Ppg():
                     for i, (d,tr) in enumerate(list(zip(dones,truncs))):
                         if d or tr:
                             s.append(total_score[i])
+                            # I had to make the reward 0 when the env is done or trunc
                             rewards[i] = 0
                             total_score[i] = 0
-                    self.memory_buffer.save(
+                    self.memory_buffer.save_ppo_data(
                         observations, actions, log_probs, values, rewards, dones)
                     observations = new_observations
                     if t == self.step_size:  # last step
@@ -131,10 +139,10 @@ class Ppg():
                                 T.tensor(observations, dtype=T.float32, device=self.device))
                             last_values_ar = last_values_t.cpu().numpy()
 
-                observation_sample, action_sample, log_probs_sample, value_sample, reward_sample, dones_sample = self.memory_buffer.sample()
+                observation_sample, action_sample, log_probs_sample, value_sample, reward_sample, dones_sample = self.memory_buffer.sample_ppo_data()
 
                 if self.normalize_rewards:
-                    reward_sample = self._normalize_rewards(reward_sample,3)
+                    reward_sample = self._normalize_rewards(reward_sample,self.max_reward_norm)
 
                 advantages_tensor = self._calculate_advantages(
                     reward_sample, value_sample, dones_sample, last_values_ar)
@@ -148,24 +156,29 @@ class Ppg():
                     value_sample.reshape((self.n_workers*self.step_size,)), dtype=T.float32, device=self.device)
 
                 for ep in range(self.n_pi_epochs):
-                    pl,en = self.train_policy(observations_tensor, actions_tensor,
+                    policy_loss,entropy = self.train_policy(observations_tensor, actions_tensor,
                                   log_probs_tensor, advantages_tensor)
-                    pls.append(pl)
-                    ens.append(en)
+                    policy_losses_info.append(policy_loss)
+                    entropies.append(entropy)
                 
                 for ep in range(self.n_v_epochs):
-                    vl= self.train_value(observations_tensor,
+                    value_loss= self.train_value(observations_tensor,
                                  value_tensor + advantages_tensor,self.n_batches)
-                    vls.append(vl)
+                    value_losses_info.append(value_loss)
                 self.memory_buffer.append_aux_data(observations_tensor.cpu().numpy(),(value_tensor+advantages_tensor).cpu().numpy())
-                self.memory_buffer.reset()
+                self.memory_buffer.reset_ppo_data()
             
+
+            # prepare to train aux
+            # get all data collected in the current phase
             all_obs_ar , returns_ar = self.memory_buffer.sample_aux_data()
             n_examples = len(all_obs_ar)
             returns_tensor = T.tensor(returns_ar,dtype=T.float32,device=self.device)
             all_old_probs_dist = T.zeros((n_examples,self.n_game_action),dtype=T.float32,device=self.device)
             batch_id = 0
             batch_size = 1024*4
+            # evaluate all old observation probabilities distributions over actions
+            # use batches to avoid full memory errors
             while batch_id < len(all_obs_ar)/batch_size:
                 start = batch_id*batch_size
                 end = (batch_id+1) * batch_size
@@ -177,11 +190,20 @@ class Ppg():
                 all_old_probs_dist[start:end].copy_(probs.detach())
                 batch_id+=1
             assert returns_tensor.device == self.device
+
+            aux_value_losses_info = []
+            aux_kl_divergence_info = []
+            aux_joint_losses_info = []
             for ep in range(self.n_aux_epochs):
-                self.train_aux(all_obs_ar,all_old_probs_dist, returns_tensor)
+                aux_value_loss ,aux_kl_divergence,aux_joint_loss = self.train_aux(all_obs_ar,all_old_probs_dist, returns_tensor)
+                aux_value_losses_info.append(aux_value_loss)
+                aux_kl_divergence_info.append(aux_kl_divergence)
+                aux_joint_losses_info.append(aux_joint_loss)
+
             self.memory_buffer.reset_aux_data()
             policy_network_scheduler.step()
             value_network_scheduler.step()
+
             if T.cuda.is_available():
                 T.cuda.empty_cache()
             if phase % 1 == 0:
@@ -192,9 +214,13 @@ class Ppg():
             score_err = (1.95 * score_std / (len(s)**0.5)) if len(s) else 0
             steps_done = phase * steps_per_phase
             total_duration = time.perf_counter()-t_start
-            value_loss = np.mean(vls)
-            policy_loss = np.mean(pls)
-            entropy = np.mean(ens)
+            value_loss = np.mean(value_losses_info)
+            policy_loss = np.mean(policy_losses_info)
+            entropy = np.mean(entropies)
+
+            aux_value_loss = np.mean(aux_value_losses_info)
+            aux_kl_divergence = np.mean(aux_kl_divergence_info)
+            aux_joint_losses_info = np.mean(aux_joint_loss)
             fps = steps_done // total_duration
             if phase % 1 == 0:
                 print(f"*************************************")
@@ -207,6 +233,10 @@ class Ppg():
                 print(f"Value Loss:     {value_loss:0.3f}")
                 print(f"Policy Loss:    {policy_loss:0.2e}")
                 print(f"Entropy:        {entropy:0.3f}")
+                print(f"Aux Value Loss: {aux_value_loss:0.3f}")
+                print(f"Aux KL-D:       {aux_kl_divergence:0.3f}")
+                print(f"Aux Joint Loss: {aux_joint_loss:0.3f}")
+
 
             summary_duration.append(total_duration)
             summary_time_step.append(phase*steps_per_phase)
@@ -319,9 +349,11 @@ class Ppg():
         np.random.shuffle(indices)
         batches = [indices[i:i+batch_size] for i in batch_starts]
 
-        
+        aux_value_losses = T.zeros((n_batches,),dtype=T.float32,device=self.device)
+        aux_kl_divergence = T.zeros((n_batches,),dtype=T.float32,device=self.device)
+        aux_joint_losses = T.zeros((n_batches,),dtype=T.float32,device=self.device)
         # Optimize Ljoint wrt theta_pi, on all data in buffer    
-        for batch in batches:
+        for i,batch in enumerate(batches):
             old_probs_batch = old_probs[batch]
             observations_batch_ar = observations[batch]
             returns_batch = returns[batch]
@@ -332,20 +364,28 @@ class Ppg():
             predicted_policy_values = predicted_policy_values.squeeze(-1)
 
             aux_loss = 0.5 * ((returns_batch - predicted_policy_values)**2).mean()
-            # kl_loss_fn = T.nn.KLDivLoss(reduction="batchmean")
-            # kl_loss = kl_loss_fn(new_probs,old_probs_batch).mean()
             kl_loss = T.distributions.kl_divergence(T.distributions.Categorical(old_probs_batch),T.distributions.Categorical(new_probs)).mean()
             joint_loss = aux_loss + self.beta_clone * kl_loss
-
             self.policy_network_optim.zero_grad()
             joint_loss.backward()
-
             if self.max_grad_norm:
                 clip_grad_norm_(self.policy_network.parameters(),self.max_grad_norm)
             self.policy_network_optim.step()
-        
+
+            with T.no_grad():
+                aux_value_losses[i] = aux_loss
+                aux_kl_divergence[i] = kl_loss
+                aux_joint_losses[i] = joint_loss
+                
+        # Train Critic network on all data in buffer
         # Optimize Lvalue wrt theta_V, on all data in buffer
         self.train_value(observations,returns,self.n_aux_batches)
+
+        # logging info
+        mean_value_loss = aux_value_losses.mean().cpu().item()
+        mean_kl_divergence = aux_kl_divergence.mean().cpu().item()
+        mean_joint_loss = aux_joint_losses.mean().cpu().item()
+        return mean_value_loss,mean_kl_divergence,mean_joint_loss
 
     def _calculate_advantages(self, rewards: np.ndarray, values: np.ndarray, terminals: np.ndarray, last_values: np.ndarray):
         adv_arr = np.zeros(
@@ -395,13 +435,15 @@ class Ppg():
         combined_std = ((all_squared_sums-(all_sums**2)/all_counts)/(all_counts-1))**0.5
         combined_err = combined_std / (all_counts**0.5 + 1e-8)
 
-        # rewards = np.clip(rewards/(np.mean(self.rewards_std)+1e-8),-max_norm,max_norm)
-        # rewards = np.clip(rewards/(max(1,flat_rewards.std())),-max_norm,max_norm)
-        # rewards = np.clip(rewards/(flat_rewards.std()+1e-8),-max_norm,max_norm)
+        
         
         rewards_1 = np.clip((rewards - combined_mean-combined_err)/(combined_std+1e-8),-max_norm,max_norm)
         rewards_2 = np.clip((rewards - combined_mean+combined_err)/(combined_std+1e-8),-max_norm,max_norm)
         rewards = rewards_1*0.5 + rewards_2*0.5
+
+        # rewards = np.clip(rewards/(max(1,flat_rewards.std())),-max_norm,max_norm)
+        # rewards = np.clip(rewards/(flat_rewards.std()+1e-8),-max_norm,max_norm)
+        # rewards = np.clip(rewards/(np.mean(self.rewards_std)+1e-8),-max_norm,max_norm)
         return rewards
     def plot_summary(self,x:list,y:list,err:list,xlabel:str,ylabel:str,file_name:str):
         fig , ax = plt.subplots()

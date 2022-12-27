@@ -29,14 +29,3 @@ class MemoryBuffer:
 
     def sample(self)->tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         return self.observations.swapaxes(0,1),self.actions.swapaxes(0,1),self.log_probs.swapaxes(0,1),self.values.swapaxes(0,1),self.rewards.swapaxes(0,1),self.terminals.swapaxes(0,1)
-
-
-    def _incerement_indices(self):
-        if self.current_worker == self.n_workers-1:
-            self.current_worker = 0
-            if self.current_step == self.worker_steps-1:
-                self.current_step = 0
-            else:
-                self.current_step += 1
-        else:
-            self.current_worker += 1
