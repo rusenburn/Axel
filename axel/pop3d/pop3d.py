@@ -20,7 +20,7 @@ class Pop3d:
                  gae_lam=0.95,
                  lr=2.5e-4,
                  entropy_coef=0.0,
-                 critic_coef=0.0,
+                 critic_coef=0.5,
                  beta=10,
                  max_grad_norm=0.5,
                  normalize_rewards=False,
