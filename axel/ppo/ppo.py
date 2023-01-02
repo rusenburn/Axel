@@ -15,8 +15,8 @@ from ..common.networks import NetworkBase, ActorNetwork, CriticNetwork, SmallAct
 class Ppo:
     def __init__(self,
                  vec_env: gym.vector.VectorEnv,
-                 total_steps=1e5,
-                 step_size=5,
+                 total_steps=1_000_000,
+                 step_size=128,
                  n_batches=4,
                  n_epochs=4,
                  gamma=0.99,
@@ -106,8 +106,8 @@ class Ppo:
         policy_losses = deque(maxlen=100)
         entropies = deque(maxlen=100)
         total_losses = deque(maxlen=100)
+        explained_variances = deque(maxlen=100)
         for iteration in range(1, int(self.total_steps//self.n_workers)+1):
-            iteration_start = time.perf_counter()
             actions, log_probs, values = self.choose_actions(observations)
             new_observations, rewards, dones, truncs, infos = self.vec_env.step(
                 actions=actions)
@@ -125,11 +125,12 @@ class Ppo:
                     last_values_t: T.Tensor = self.critic(
                         T.tensor(observations.copy(), dtype=T.float32, device=self.device))
                     last_values_ar: np.ndarray = last_values_t.cpu().numpy()
-                p_loss ,v_loss,ent , total_loss = self.train_network(last_values_ar)
+                p_loss ,v_loss,ent , total_loss,explained_variance = self.train_network(last_values_ar)
                 value_losses.append(v_loss)
                 policy_losses.append(p_loss)
                 entropies.append(ent)
                 total_losses.append(total_loss)
+                explained_variances.append(explained_variance)
                 self.memory_buffer.reset()
                 self.actor.save_model(os.path.join("tmp", "actor.pt"))
                 self.critic.save_model(os.path.join("tmp", "critic.pt"))
@@ -149,6 +150,7 @@ class Ppo:
                 v_loss = np.mean(value_losses)
                 p_loss = np.mean(p_loss)
                 ent = np.mean(entropies)
+                explained_variance = np.mean(explained_variances)
                 print(f"**************************************************")
                 print(f"Iteration:      {iteration} of {total_iterations}")
                 print(f"Learning rate:  {actor_scheduler.get_last_lr()[0]:0.3e}")
@@ -161,6 +163,7 @@ class Ppo:
                 print(f"Value Loss:     {v_loss:0.3f}")
                 print(f"Policy Loss:    {p_loss:0.3f}")
                 print(f"Entropy:        {ent:0.3f}")
+                print(f"E-Var-ratio:    {explained_variance:0.3f}")
 
                 summary_duration.append(total_duration)
                 summary_time_step.append(steps_done)
@@ -171,7 +174,7 @@ class Ppo:
                 policy_losses.clear()
                 entropies.clear()
                 total_losses.clear()
-
+                explained_variances.clear()
 
             actor_scheduler.step()
             critic_shceduler.step()
@@ -203,7 +206,6 @@ class Ppo:
 
         advantages_tensor = self._calculate_advatages(
                 reward_batches, value_batches, terminal_batches, last_values)
-        
         # normalize adv
         if self.normalize_adv:
                     normalized_advantages_tensor = (
@@ -213,6 +215,20 @@ class Ppo:
         policy_loss_info = T.zeros((self.n_epochs,self.n_batches,),dtype=T.float32,device=self.device)
         entropies_info = T.zeros((self.n_epochs,self.n_batches),dtype=T.float32,device=self.device)
         total_losses_info = T.zeros((self.n_epochs,self.n_batches),dtype=T.float32,device=self.device)
+
+        states_arr = state_batches.reshape(
+                (self.n_workers*self.step_size, *self.vec_env.single_observation_space.shape))
+        actions_arr = action_batches.reshape(
+            (self.n_workers*self.step_size,))
+        log_probs_arr = log_prob_batches.reshape(
+            (self.n_workers*self.step_size,))
+        values_arr = value_batches.reshape(
+            (self.n_workers*self.step_size,))
+        values_tensor = T.tensor(values_arr, device=self.device)
+
+        # TODO use all returns
+        all_rets = values_tensor + advantages_tensor
+        exaplained_variance = self._calculate_explained_variance(values_tensor,all_rets)
         for epoch in range(self.n_epochs):
             batch_starts = np.arange(
                 0, self.n_workers*self.step_size, batch_size)
@@ -221,15 +237,6 @@ class Ppo:
 
             batches = [indices[i:i+batch_size] for i in batch_starts]
 
-            states_arr = state_batches.reshape(
-                (self.n_workers*self.step_size, *self.vec_env.single_observation_space.shape))
-            actions_arr = action_batches.reshape(
-                (self.n_workers*self.step_size,))
-            log_probs_arr = log_prob_batches.reshape(
-                (self.n_workers*self.step_size,))
-            values_arr = value_batches.reshape(
-                (self.n_workers*self.step_size,))
-            values_tensor = T.tensor(values_arr, device=self.device)
             for i,batch in enumerate(batches):
                 states_tensor: T.Tensor = T.tensor(
                     states_arr[batch], dtype=T.float32, device=self.device)
@@ -296,7 +303,7 @@ class Ppo:
             policy_loss_mean = policy_loss_info.flatten().mean()
             entropy_mean= entropies_info.flatten().mean()
             total_loss_mean = total_losses_info.flatten().mean()
-        return policy_loss_mean.cpu().item(),value_loss_mean.cpu().item(),entropy_mean.cpu().item(),total_loss_mean.cpu().item()
+        return policy_loss_mean.cpu().item(),value_loss_mean.cpu().item(),entropy_mean.cpu().item(),total_loss_mean.cpu().item(),exaplained_variance
             
 
     def _calculate_advatages(self, rewards: np.ndarray, values: np.ndarray, terminals: np.ndarray, last_values: np.ndarray):
@@ -338,3 +345,11 @@ class Ppo:
         self.rewards_mean.append(current_rewards_mean)
         rewards = np.clip(rewards /(np.mean(self.rewards_std)+1e-8),-max_norm,max_norm)
         return rewards
+    
+    @staticmethod
+    def _calculate_explained_variance(prediction:T.Tensor,target:T.Tensor)->float:
+        assert prediction.ndim == 1 and target.ndim == 1
+        target_var = target.var()+1e-8
+        unexplained_var_ratio = (target-prediction).var()/target_var
+        explained_var_ratio = 1 - unexplained_var_ratio
+        return explained_var_ratio.cpu().item()

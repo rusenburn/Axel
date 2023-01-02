@@ -276,8 +276,6 @@ class Ppg():
             old_log_probs_batch = log_probs[batch]
             actions_batch = actions[batch]
             advantages_batch = advantages[batch].clone()
-            # if self.normalize_adv:
-            #     advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std()+1e-8)
             
             predicted_probs:T.Tensor
             predicted_probs , _ = self.policy_network(observation_batch)

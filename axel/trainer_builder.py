@@ -1,16 +1,20 @@
-from ppo.ppo_builder import PpoBuilder
-from ppg.ppg_builder import PpgBuilder
-from pop3d.pop3d_builder import Pop3dBuilder
+from .ppo.ppo_builder import PpoBuilder
+from .ppg.ppg_builder import PpgBuilder
+from .pop3d.pop3d_builder import Pop3dBuilder
 
 class TrainerBuilder():
     def __init__(self) -> None:
         ...
 
-    def use_ppo(self)->PpoBuilder:
-        return PpoBuilder()
+    @staticmethod
+    def use_ppo()->PpoBuilder:
+        builder =  PpoBuilder()
+        return builder
     
-    def use_ppg(self):
+    @staticmethod
+    def use_ppg():
         return PpgBuilder()
     
-    def use_pop3d(self):
+    @staticmethod
+    def use_pop3d():
         return Pop3dBuilder()
