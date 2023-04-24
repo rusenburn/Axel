@@ -19,8 +19,8 @@ class PpgMemoryBuffer():
     def save_ppo_data(self, step_observations: np.ndarray, step_actions: np.ndarray, step_log_probs: np.ndarray, step_values: np.ndarray, step_rewards: np.ndarray, step_terminals: np.ndarray):
         return self.ppo_memory_buffer.save(step_observations, step_actions, step_log_probs, step_values, step_rewards, step_terminals)
     
-    def sample_ppo_data(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        return self.ppo_memory_buffer.sample()
+    def sample_ppo_data(self,step_based:bool=False) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        return self.ppo_memory_buffer.sample(step_based)
 
     def reset_aux_data(self):
         self.aux_observations = np.zeros((self.n_examples,*self.observation_shape),dtype=np.float32)

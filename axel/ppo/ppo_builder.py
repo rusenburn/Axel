@@ -48,7 +48,11 @@ class PpoBuilder():
         return self
 
     def vec_env(self,vec_env:gym.vector.VectorEnv)->'PpoBuilder':
-        self._vec_env = vec_env
+        if self._vec_env == vec_env:
+            return self
+        else:
+            self._vec_env.close()
+            self._vec_env = vec_env
         return self
     
     def total_steps(self,total_steps:int):

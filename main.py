@@ -33,18 +33,13 @@ def train_pop3d():
 def train_ppo():
     env_fns = [get_env for _ in range(8)]
     vec_env = AsyncVectorEnv(env_fns=env_fns)
-    # ppo = Ppo(vec_env=vec_env, step_size=128,
-    #           total_steps=int(1e6),
-    #           policy_clip=0.1,
-    #           normalize_rewards=True,
-    #           normalize_adv=False)
     ppo = (TrainerBuilder
             .use_ppo()
-            .use_defaults()
             .total_steps(1e6)
             .policy_clip(0.1)
             .enable_rewards_normalisation()
             .disable_advantages_normalisation()
+            .vec_env(vec_env)
             .build())
     ppo.run()
     vec_env.close()
@@ -53,20 +48,6 @@ def train_ppo():
 def train_ppg():
     env_fns = [get_env for _ in range(8)]
     vec_env = AsyncVectorEnv(env_fns=env_fns)
-    # ppg = Ppg(
-    #     vec_env=vec_env, total_steps=int(1e6),
-    #     step_size=256,
-    #     clip_ratio=0.2,
-    #     n_pi=32,
-    #     n_aux_epochs=6,
-    #     n_pi_epochs=1, n_v_epochs=1,
-    #     n_batches=8,
-    #     n_aux_batches=16,
-    #     lr=5e-4,
-    #     normalize_rewards=True,
-    #     normalize_adv=False,
-    #     entropy_coef=0)
-
     ppg = (TrainerBuilder.use_ppg()
                 .step_size(256)
                 .clip_ratio(0.2)
@@ -154,13 +135,15 @@ def train_pop3d_cartpole():
     pop3d = Pop3d(vec_env,
             total_steps=1e6,
             step_size=20,
-            entropy_coef=0,beta=10
+            entropy_coef=0,
+            beta=10,
+            normalize_adv=True
             )
     pop3d.run()
 
 def main():
-    # train_pop3d()
-    train_ppg()
+    train_pop3d()
+    # train_ppg()
     # train_ppo()
     # train_ppg_cartpole()
     # train_ppg_acrobat()

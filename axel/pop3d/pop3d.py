@@ -122,7 +122,7 @@ class Pop3d:
                 with T.no_grad():
                     _, last_values_tensor = self.network(
                         T.tensor(observations, dtype=T.float32, device=self.device))
-                    last_values_ar: np.ndarray = last_values_tensor.cpu().numpy()
+                    last_values_ar: np.ndarray = last_values_tensor.squeeze().cpu().numpy()
 
                 v_loss, p_loss, ent, total_loss = self.train_network(
                     last_values_ar)
@@ -146,14 +146,15 @@ class Pop3d:
                 score_err = 1.95 * score_std/(len(s)**0.5) if len(s) else 0
                 fps = steps_done//total_duration
 
-                v_loss:float = np.mean(value_losses)
-                p_loss:float = np.mean(policy_losses)
-                ent:float = np.mean(entropies)
-                total_loss:float = np.mean(total_losses)
+                v_loss: float = np.mean(value_losses)
+                p_loss: float = np.mean(policy_losses)
+                ent: float = np.mean(entropies)
+                total_loss: float = np.mean(total_losses)
                 print(f"**************************************************")
                 print(
                     f"Iteration:      {iteration} of {int(total_iterations)}")
-                print(f"learning rate:  {network_scheduler.get_last_lr()[0]:0.3e}")
+                print(
+                    f"learning rate:  {network_scheduler.get_last_lr()[0]:0.3e}")
                 print(
                     f"Total Steps:    {steps_done} of {int(self.total_steps)}")
                 print(f"Total duration: {total_duration:0.2f} seconds")
@@ -200,20 +201,44 @@ class Pop3d:
 
     def train_network(self, last_values: np.ndarray):
         # self.network.train
-        observation_batches, action_batches, log_prob_batches, value_batches, reward_batches, terminal_batches = self.memory_buffer.sample()
+        sample_size = self.n_workers*self.step_size
+        batch_size = (sample_size) // self.n_batches
+
+        observation_sample, action_sample, log_prob_samples,\
+            value_samples, reward_samples, terminal_samples = self.memory_buffer.sample(
+                step_based=True)
+
         if self.normalize_rewards:
-            reward_batches = self._normalize_rewards(
-                reward_batches, self.max_reward_norm)
-        advantages_tensor: T.Tensor = self._calculate_advantages(
-            reward_batches, value_batches, terminal_batches, last_values)
+            reward_samples = self._normalize_rewards(
+                reward_samples, self.max_reward_norm)
 
+        all_advantages_ar, all_returns_ar = self._calc_adv(
+            reward_samples, value_samples, terminal_samples, last_values)
+
+        all_observation_ar = observation_sample.reshape(
+            (sample_size, *self.observation_shape))
+        all_actions_arr = action_sample.reshape(
+            (sample_size,))
+        all_log_probs_arr = log_prob_samples.reshape(
+            (sample_size,))
+        all_values_ar = value_samples.reshape(
+            (sample_size,))
+
+        all_observation_tensor = T.tensor(
+            all_observation_ar, dtype=T.float32, device=self.device)
+        all_actions_tensor = T.tensor(
+            all_actions_arr, dtype=T.int32, device=self.device)
+        all_log_probs_tensor = T.tensor(
+            all_log_probs_arr, dtype=T.float32, device=self.device)
+        all_values_tensor = T.tensor(
+            all_values_ar, dtype=T.float32, device=self.device)
+        all_advantages_tensor: T.Tensor = T.tensor(
+            all_advantages_ar.flatten(), dtype=T.float32, device=self.device)
+        all_returns_tensor: T.Tensor = T.tensor(
+            all_returns_ar.flatten(), dtype=T.float32, device=self.device)
         if self.normalize_adv:
-            all_norm_or_not_adv = (
-                advantages_tensor - advantages_tensor.mean()) / (advantages_tensor.std()+1e-8)
-        else:
-            all_norm_or_not_adv = advantages_tensor
-
-        batch_size = (self.step_size * self.n_workers) // self.n_batches
+            all_advantages_tensor = (
+                all_advantages_tensor - all_advantages_tensor.mean()) / (all_advantages_tensor.std()+1e-8)
 
         entropy_info = T.zeros(
             (self.n_epochs, self.n_batches), dtype=T.float32, device=self.device)
@@ -230,33 +255,15 @@ class Pop3d:
             np.random.shuffle(indices)
 
             batches = [indices[i:i+batch_size] for i in batch_starts]
-
-            observation_arr = observation_batches.reshape(
-                (self.n_workers*self.step_size, *self.observation_shape))
-            actions_arr = action_batches.reshape(
-                (self.n_workers*self.step_size,))
-            log_probs_arr = log_prob_batches.reshape(
-                (self.n_workers*self.step_size,))
-            values_arr = value_batches.reshape(
-                (self.n_workers*self.step_size,))
-            values_tensor = T.tensor(values_arr, device=self.device)
             for i, batch in enumerate(batches):
-                observation_tensor = T.tensor(
-                    observation_arr[batch], dtype=T.float32, device=self.device)
-                old_log_prob_tensor: T.Tensor = T.tensor(
-                    log_probs_arr[batch], dtype=T.float32, device=self.device)
-                actions_tensor = T.tensor(
-                    actions_arr[batch], device=self.device)
+                observation_batch = all_observation_tensor[batch]
+                old_log_prob_batch: T.Tensor = all_log_probs_tensor[batch]
+                actions_batch = all_actions_tensor[batch]
+                advantages_batch = all_advantages_tensor[batch]
+                returns_batch = all_returns_tensor[batch]
 
-                # normalized adv used in actor loss not value loss
-                if self.normalize_adv:
-                    norm_or_not_adv = all_norm_or_not_adv[batch].clone()
-                else:
-                    norm_or_not_adv = advantages_tensor[batch].clone()
-
-                predicted_values: T.Tensor
-                probs: T.Tensor
-                probs, predicted_values = self.network(observation_tensor)
+                z: tuple[T.Tensor, T.Tensor] = self.network(observation_batch)
+                probs, predicted_values = z
                 predicted_values = predicted_values.squeeze()
 
                 # get entropy
@@ -265,23 +272,22 @@ class Pop3d:
 
                 # get policy loss
                 predicted_log_probs: T.Tensor = probs_dist.log_prob(
-                    actions_tensor)
+                    actions_batch)
                 predicted_probs = predicted_log_probs.exp()
-                old_probs = old_log_prob_tensor.exp()
+                old_probs = old_log_prob_batch.exp()
 
                 dpp = ((old_probs-predicted_probs)**2).mean()
 
-                prob_ratio = predicted_probs/old_probs
+                prob_ratio: T.Tensor = predicted_probs/old_probs
 
-                weighted_prob_ratio = (
-                    prob_ratio * norm_or_not_adv).mean()
+                weighted_prob_ratio: T.Tensor = (
+                    prob_ratio * advantages_batch).mean()
 
                 policy_loss = self.beta * dpp - weighted_prob_ratio
 
-                # NOTE we use non-normalized advantages to calculate returns
-                returns = advantages_tensor[batch] + values_tensor[batch]
-                critic_loss = 0.5*((returns - predicted_values)**2).mean()
-                total_loss = policy_loss + self.critic_coef * \
+                critic_loss = 0.5 * \
+                    ((returns_batch - predicted_values)**2).mean()
+                total_loss: T.Tensor = policy_loss + self.critic_coef * \
                     critic_loss + self.entropy_coef * entropy
                 self.network.zero_grad()
                 total_loss.backward()
@@ -303,27 +309,34 @@ class Pop3d:
 
         return mean_value_loss.cpu().item(), mean_policy_loss.cpu().item(), mean_entropy.cpu().item(), mean_total_loss.cpu().item()
 
-    def _calculate_advantages(self, rewards: np.ndarray, values: np.ndarray, terminals: np.ndarray, last_values: np.ndarray):
-        adv_arr = np.zeros(
-            (self.n_workers, self.step_size+1), dtype=np.float32)
-        next_val: float
-        for i in range(self.n_workers):
-            for t in reversed(range(self.step_size)):
-                current_reward = rewards[i][t]
-                current_val = values[i][t]
-                if t == self.step_size-1:  # last step
-                    next_val = last_values[i]
-                else:
-                    next_val = values[i][t+1]
-                delta = current_reward + \
-                    (self.gamma * next_val *
-                     (1-int(terminals[i][t]))) - current_val
-                adv_arr[i][t] = delta + (self.gamma*self.gae_lam *
-                                         adv_arr[i][t+1] * (1-int(terminals[i][t])))
-        adv_arr = adv_arr[:, :-1]
-        advantages = T.tensor(
-            adv_arr.flatten(), dtype=T.float32, device=self.device)
-        return advantages
+    def _calc_adv(self, rewards: np.ndarray, values: np.ndarray, terminals: np.ndarray, last_values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        sample_size = len(values)
+        advs = np.zeros_like(values)
+        returns = np.zeros_like(values)
+
+        next_val = last_values.copy()
+        next_adv = np.zeros_like(last_values)
+        gamma = self.gamma
+        gae_lam = self.gae_lam
+
+        for t in reversed(range(sample_size)):
+            current_terminals: np.ndarray = terminals[t]
+            current_rewards: np.ndarray = rewards[t]
+            current_values: np.ndarray = values[t]
+
+            next_val[current_terminals] = 0
+            next_adv[current_terminals] = 0
+
+            delta = current_rewards + gamma * next_val - current_values
+
+            current_adv = delta + gamma * gae_lam * next_adv
+            next_val = current_values.copy()
+            next_adv = current_adv.copy()
+
+            advs[t] = current_adv
+            returns[t] = current_adv + current_values
+
+        return advs, returns
 
     def _normalize_rewards(self, rewards: np.ndarray, max_norm: float) -> np.ndarray:
         # normalize rewards by dividing rewards by average moving standard deviation and clip any  value not in range [-max_norm,max_norm]

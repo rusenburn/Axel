@@ -27,5 +27,7 @@ class MemoryBuffer:
         self.current_step+=1
 
 
-    def sample(self)->tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def sample(self , step_based : bool = False)->tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        if step_based:
+            return self.observations,self.actions,self.log_probs,self.values,self.rewards,self.terminals
         return self.observations.swapaxes(0,1),self.actions.swapaxes(0,1),self.log_probs.swapaxes(0,1),self.values.swapaxes(0,1),self.rewards.swapaxes(0,1),self.terminals.swapaxes(0,1)

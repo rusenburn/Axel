@@ -57,6 +57,9 @@ class PpgBuilder():
         self._decay_lr = True
 
     def vec_env(self,vec_env:gym.vector.VectorEnv):
+        if self._vec_env == vec_env:
+            return self
+        self._vec_env.close()
         self._vec_env = vec_env
         return self
     

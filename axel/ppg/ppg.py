@@ -2,6 +2,7 @@ import os
 import time
 import gym
 import tqdm
+import gym.vector
 import torch as T
 import numpy as np
 import matplotlib.pyplot as plt
@@ -36,7 +37,7 @@ class Ppg():
 
         self.vec_env = vec_env
         self.n_workers = vec_env.num_envs
-        self.n_game_action = vec_env.single_action_space.n
+        self.n_game_action = vec_env.single_action_space.n # type: ignore
         self.observation_shape = vec_env.single_observation_space.shape
 
         self.total_steps = total_steps
@@ -137,15 +138,18 @@ class Ppg():
                         with T.no_grad():
                             last_values_t = self.value_network(
                                 T.tensor(observations, dtype=T.float32, device=self.device))
-                            last_values_ar = last_values_t.cpu().numpy()
+                            last_values_ar = last_values_t.squeeze().cpu().numpy()
 
-                observation_sample, action_sample, log_probs_sample, value_sample, reward_sample, dones_sample = self.memory_buffer.sample_ppo_data()
+                (observation_sample, action_sample, log_probs_sample,
+                  value_sample, reward_sample, dones_sample) = self.memory_buffer.sample_ppo_data(step_based=True)
 
                 if self.normalize_rewards:
                     reward_sample = self._normalize_rewards(reward_sample,self.max_reward_norm)
 
-                advantages_tensor = self._calculate_advantages(
-                    reward_sample, value_sample, dones_sample, last_values_ar)
+                advantages_arr ,returns_ar =  self._calc_adv(reward_sample, value_sample, dones_sample, last_values_ar)
+
+                advantages_tensor = T.tensor(advantages_arr.flatten(),device=self.device,dtype=T.float32)
+                returns_tensor = T.tensor(returns_ar.flatten(),device=self.device,dtype=T.float32)
 
                 observations_tensor = T.tensor(
                     observation_sample.reshape((self.n_workers*self.step_size,*self.observation_shape)), dtype=T.float32, device=self.device)
@@ -163,7 +167,7 @@ class Ppg():
                 
                 for ep in range(self.n_v_epochs):
                     value_loss= self.train_value(observations_tensor,
-                                 value_tensor + advantages_tensor,self.n_batches)
+                                 returns_tensor,self.n_batches)
                     value_losses_info.append(value_loss)
                 self.memory_buffer.append_aux_data(observations_tensor.cpu().numpy(),(value_tensor+advantages_tensor).cpu().numpy())
                 self.memory_buffer.reset_ppo_data()
@@ -253,7 +257,6 @@ class Ppg():
             probs:T.Tensor
             probs,_ = self.policy_network(observation_tensor)
             values:T.Tensor = self.value_network(observation_tensor)
-        
         action_sample = T.distributions.Categorical(probs)
         actions = action_sample.sample()
         log_probs :T.Tensor= action_sample.log_prob(actions)
@@ -307,10 +310,10 @@ class Ppg():
         return policy_loss,entropy_loss
 
     def train_value(self,observations:T.Tensor|np.ndarray,returns:T.Tensor,n_batches:int):
-        size = observations.shape[0]
-        batch_size = size // n_batches
-        batch_starts = np.arange(0, size,batch_size)
-        indices = np.arange(size)
+        sample_size = observations.shape[0]
+        batch_size = sample_size // n_batches
+        batch_starts = np.arange(0, sample_size,batch_size)
+        indices = np.arange(sample_size)
         np.random.shuffle(indices)
         batches = [indices[i:i+batch_size] for i in batch_starts]
         losses = T.zeros((n_batches,),dtype=T.float32,device=self.device)
@@ -409,6 +412,35 @@ class Ppg():
 
         return advantages
 
+
+    def _calc_adv(self,rewards:np.ndarray,values:np.ndarray,terminals:np.ndarray,last_values:np.ndarray)->tuple[np.ndarray,np.ndarray]:
+        sample_size = len(values)
+        advs = np.zeros_like(values)
+        returns = np.zeros_like(values)
+
+        next_val = last_values.copy()
+        next_adv = np.zeros_like(last_values)
+        gamma = self.gamma
+        gae_lam = self.gae_lam
+
+        for t in reversed(range(sample_size)):
+            current_terminals :np.ndarray= terminals[t]
+            current_rewards : np.ndarray = rewards[t]
+            current_values : np.ndarray = values[t]
+
+            next_val[current_terminals] = 0
+            next_adv[current_terminals] = 0
+
+            delta = current_rewards + gamma * next_val - current_values
+
+            current_adv = delta + gamma * gae_lam * next_adv
+            next_val = current_values.copy()
+            next_adv = current_adv.copy()
+
+            advs[t] = current_adv
+            returns[t] = current_adv + current_values
+        
+        return advs,returns
 
     def _normalize_rewards(self,rewards:np.ndarray,max_norm=10)->np.ndarray:
         # normalize rewards by dividing rewards by their standard deviation and clip any  value not in range (-max_norm,max_norm)

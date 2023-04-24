@@ -124,7 +124,7 @@ class Ppo:
                 with T.no_grad():
                     last_values_t: T.Tensor = self.critic(
                         T.tensor(observations.copy(), dtype=T.float32, device=self.device))
-                    last_values_ar: np.ndarray = last_values_t.cpu().numpy()
+                    last_values_ar: np.ndarray = last_values_t.squeeze().cpu().numpy()
                 p_loss ,v_loss,ent , total_loss,explained_variance = self.train_network(last_values_ar)
                 value_losses.append(v_loss)
                 policy_losses.append(p_loss)
@@ -138,9 +138,9 @@ class Ppo:
                 T.save(self.critic_optim, os.path.join(
                     "tmp", "critic_optim.pt"))
 
-            if iteration*self.n_workers % 1_000 < self.n_workers:
+            steps_done = self.n_workers * iteration
+            if iteration*self.n_workers % 2_000 < self.n_workers:
                 total_duration = time.perf_counter()-t_start
-                steps_done = self.n_workers * iteration
                 fps = steps_done // total_duration
                 score_mean = np.mean(s) if len(s) > 0 else 0
                 score_std = np.std(s) if len(s) > 0 else 0
@@ -148,7 +148,7 @@ class Ppo:
                     (len(s)**0.5) if len(s) > 0 else 0
                 total_loss = np.mean(total_losses)
                 v_loss = np.mean(value_losses)
-                p_loss = np.mean(p_loss)
+                p_loss = np.mean(policy_losses)
                 ent = np.mean(entropies)
                 explained_variance = np.mean(explained_variances)
                 print(f"**************************************************")
@@ -197,38 +197,45 @@ class Ppo:
 
     def train_network(self, last_values: np.ndarray):
         # self.train
-        batch_size = (self.step_size*self.n_workers) // self.n_batches
-        state_batches, action_batches, log_prob_batches, \
-                value_batches, reward_batches, terminal_batches = self.memory_buffer.sample()
+        sample_size = self.n_workers*self.step_size
+        batch_size = (sample_size) // self.n_batches
+        state_samples, action_samples, log_prob_samples, \
+                value_samples, reward_samples, terminal_samples = self.memory_buffer.sample(step_based=True)
         
         if self.normalize_rewards:
-            reward_batches = self._normalize_rewards(reward_batches,self.max_reward_norm)
+            reward_samples = self._normalize_rewards(reward_samples,self.max_reward_norm)
 
-        advantages_tensor = self._calculate_advatages(
-                reward_batches, value_batches, terminal_batches, last_values)
+        advantages_arr , returns_arr = self._calc_adv(reward_samples,value_samples,terminal_samples,last_values)
+
+        all_advantages_tensor = T.tensor(advantages_arr.flatten(),dtype=T.float32,device=self.device)
+        all_returns_tensor = T.tensor(returns_arr.flatten(),dtype=T.float32,device=self.device)
+
         # normalize adv
         if self.normalize_adv:
-                    normalized_advantages_tensor = (
-                        advantages_tensor - advantages_tensor.mean())/(advantages_tensor.std()+1e-8)
+                    all_advantages_tensor = (
+                        all_advantages_tensor - all_advantages_tensor.mean())/(all_advantages_tensor.std()+1e-8)
 
         value_loss_info = T.zeros((self.n_epochs,self.n_batches),dtype=T.float32,device=self.device)
         policy_loss_info = T.zeros((self.n_epochs,self.n_batches,),dtype=T.float32,device=self.device)
         entropies_info = T.zeros((self.n_epochs,self.n_batches),dtype=T.float32,device=self.device)
         total_losses_info = T.zeros((self.n_epochs,self.n_batches),dtype=T.float32,device=self.device)
 
-        states_arr = state_batches.reshape(
-                (self.n_workers*self.step_size, *self.vec_env.single_observation_space.shape))
-        actions_arr = action_batches.reshape(
-            (self.n_workers*self.step_size,))
-        log_probs_arr = log_prob_batches.reshape(
-            (self.n_workers*self.step_size,))
-        values_arr = value_batches.reshape(
-            (self.n_workers*self.step_size,))
-        values_tensor = T.tensor(values_arr, device=self.device)
+        all_states_arr = state_samples.reshape(
+                (sample_size, *self.vec_env.single_observation_space.shape))
+        all_actions_arr = action_samples.reshape(
+            (sample_size,))
+        all_log_probs_arr = log_prob_samples.reshape(
+            (sample_size,))
+        all_values_arr = value_samples.reshape(
+            (sample_size,))
+        
+        all_states_tensor = T.tensor(all_states_arr, device=self.device)
+        all_actions_tensor = T.tensor(all_actions_arr, device=self.device)
+        all_log_probs_tensor = T.tensor(all_log_probs_arr, device=self.device)
+        all_values_tensor = T.tensor(all_values_arr, device=self.device)
 
-        # TODO use all returns
-        all_rets = values_tensor + advantages_tensor
-        exaplained_variance = self._calculate_explained_variance(values_tensor,all_rets)
+        exaplained_variance = self._calculate_explained_variance(all_values_tensor,all_returns_tensor)
+
         for epoch in range(self.n_epochs):
             batch_starts = np.arange(
                 0, self.n_workers*self.step_size, batch_size)
@@ -238,18 +245,11 @@ class Ppo:
             batches = [indices[i:i+batch_size] for i in batch_starts]
 
             for i,batch in enumerate(batches):
-                states_tensor: T.Tensor = T.tensor(
-                    states_arr[batch], dtype=T.float32, device=self.device)
-                old_log_probs_tensor: T.Tensor = T.tensor(
-                    log_probs_arr[batch], dtype=T.float32, device=self.device)
-                actions_tensor: T.Tensor = T.tensor(
-                    actions_arr[batch], device=self.device)
-
-                # Normalize advantages
-                if self.normalize_adv:
-                    normalized_advatages = normalized_advantages_tensor[batch].clone()
-                else:
-                    normalized_advatages = advantages_tensor[batch].clone()
+                states_tensor: T.Tensor = all_states_tensor[batch]
+                old_log_probs_batch: T.Tensor = all_log_probs_tensor[batch]
+                actions_batch: T.Tensor = all_actions_tensor[batch]
+                advantages_batch = all_advantages_tensor[batch]
+                returns_batch = all_returns_tensor[batch]
 
                 # get predictions for current batch of states
                 probs: T.Tensor = self.actor(states_tensor)
@@ -261,23 +261,22 @@ class Ppo:
                 entropy: T.Tensor = dist.entropy().mean()
 
                 # find actor loss
-                new_log_probs: T.Tensor = dist.log_prob(actions_tensor)
-                prob_ratio = (new_log_probs-old_log_probs_tensor).exp()
-                weighted_probs = normalized_advatages * prob_ratio
+                new_log_probs: T.Tensor = dist.log_prob(actions_batch)
+                prob_ratio = (new_log_probs-old_log_probs_batch).exp()
+                weighted_probs = advantages_batch * prob_ratio
                 clipped_prob_ratio = prob_ratio.clamp(
                     1-self.policy_clip, 1+self.policy_clip)
-                weighted_clipped_probs = normalized_advatages * clipped_prob_ratio
+                weighted_clipped_probs = advantages_batch * clipped_prob_ratio
                 actor_loss = -T.min(weighted_probs,
                                     weighted_clipped_probs).mean()
 
-                # find critic loss ## NOTE We do not use the normalized advantages here
-                returns = advantages_tensor[batch] + values_tensor[batch]
-                old_values_predictions = values_tensor[batch]
+                # Find critic loss
+                old_values_predictions = all_values_tensor[batch]
                 clipped_values_predictions = old_values_predictions + \
                     T.clamp(critic_values-old_values_predictions, -
                             self.policy_clip, self.policy_clip)
-                critic_loss = (returns - critic_values)**2
-                critic_loss_2 = (returns - clipped_values_predictions)**2
+                critic_loss = (returns_batch - critic_values)**2
+                critic_loss_2 = (returns_batch - clipped_values_predictions)**2
                 critic_loss = 0.5*T.max(critic_loss, critic_loss_2).mean()
                 total_loss = actor_loss + self.critic_coef * critic_loss - self.entropy_coef * entropy
 
@@ -306,28 +305,35 @@ class Ppo:
         return policy_loss_mean.cpu().item(),value_loss_mean.cpu().item(),entropy_mean.cpu().item(),total_loss_mean.cpu().item(),exaplained_variance
             
 
-    def _calculate_advatages(self, rewards: np.ndarray, values: np.ndarray, terminals: np.ndarray, last_values: np.ndarray):
-        adv_arr = np.zeros(
-            (self.n_workers, self.step_size+1), dtype=np.float32)
-        next_val: float
-        for i in range(self.n_workers):
-            for t in reversed(range(self.step_size)):
-                current_reward = rewards[i][t]
-                current_val = values[i][t]
-                if t == self.step_size-1:  # last step
-                    next_val = last_values[i]
-                else:
-                    next_val = values[i][t+1]
-                delta = current_reward + \
-                    (self.gamma * next_val *
-                     (1-int(terminals[i][t]))) - current_val
-                adv_arr[i][t] = delta + (self.gamma*self.gae_lam *
-                                         adv_arr[i][t+1] * (1-int(terminals[i][t])))
-        adv_arr = adv_arr[:, :-1]
-        advantages = T.tensor(
-            adv_arr.flatten(), dtype=T.float32, device=self.device)
+    def _calc_adv(self,rewards:np.ndarray,values:np.ndarray,terminals:np.ndarray,last_values:np.ndarray)->tuple[np.ndarray,np.ndarray]:
+        sample_size = len(values)
+        advs = np.zeros_like(values)
+        returns = np.zeros_like(values)
 
-        return advantages
+        next_val = last_values.copy()
+        next_adv = np.zeros_like(last_values)
+        gamma = self.gamma
+        gae_lam = self.gae_lam
+
+        for t in reversed(range(sample_size)):
+            current_terminals :np.ndarray= terminals[t]
+            current_rewards : np.ndarray = rewards[t]
+            current_values : np.ndarray = values[t]
+
+            next_val[current_terminals] = 0
+            next_adv[current_terminals] = 0
+
+            delta = current_rewards + gamma * next_val - current_values
+
+            current_adv = delta + gamma * gae_lam * next_adv
+            next_val = current_values.copy()
+            next_adv = current_adv.copy()
+
+            advs[t] = current_adv
+            returns[t] = current_adv + current_values
+        
+        return advs,returns
+
 
     def plot_summary(self, x: list, y: list, err: list, xlabel: str, ylabel: str, file_name: str):
         fig, ax = plt.subplots()
