@@ -8,8 +8,11 @@ from collections import deque
 from torch.optim import Adam
 from torch.distributions import Categorical
 from torch.nn.utils.clip_grad import clip_grad_norm_
+
+from axel.common.running_normalizer import RunningNormalizer
 from .memory_buffer import MemoryBuffer
-from ..common.networks import NetworkBase, ActorNetwork, CriticNetwork, SmallActorNetwork, SmallCriticNetwork
+from axel.common.utils import calculate_explained_variance, seconds_to_HMS
+from axel.common.networks import ActorNetwork, CriticNetwork, ImpalaActorCritic, ImpalaCritic, NetworkBase, CnnActorNetwork, CnnCriticNetwork, SmallActorNetwork, SmallCriticNetwork
 
 
 class Ppo:
@@ -27,9 +30,10 @@ class Ppo:
                  critic_coef=0.5,
                  max_grad_norm=0.5,
                  normalize_adv=True,
-                 normalize_rewards=False,
+                 normalize_rewards=True,
                  max_reward_norm = 3,
-                 decay_lr=True) -> None:
+                 decay_lr=True,
+                 residual=True) -> None:
 
         self.vec_env = vec_env
         self.n_workers = vec_env.num_envs
@@ -58,16 +62,21 @@ class Ppo:
         self.max_grad_norm = 0.5
         self.normalize_rewards = normalize_rewards
         self.max_reward_norm = max_reward_norm
+        self.reward_normalizer = RunningNormalizer(maxlen=100,gamma=gamma)
 
         self.memory_buffer = MemoryBuffer(
             self.vec_env.single_observation_space.shape, self.vec_env.num_envs, self.step_size)
         
 
         if len(self.observation_shape)>2:
-            self.actor = ActorNetwork(
-                self.vec_env.single_observation_space.shape, self.n_game_actions)
-            self.critic = CriticNetwork(
-                self.vec_env.single_observation_space.shape)
+            if residual:
+                self.actor : ActorNetwork = ImpalaActorCritic(self.vec_env.single_observation_space.shape,self.n_game_actions)
+                self.critic : CriticNetwork = ImpalaCritic(self.vec_env.single_observation_space.shape,self.n_game_actions)
+            else:
+                self.actor : ActorNetwork = CnnActorNetwork(
+                    self.vec_env.single_observation_space.shape, self.n_game_actions)
+                self.critic : CriticNetwork = CnnCriticNetwork(
+                    self.vec_env.single_observation_space.shape)
         else:
             self.actor = SmallActorNetwork(self.n_game_actions,self.observation_shape)
             self.critic = SmallCriticNetwork(self.observation_shape)
@@ -77,8 +86,10 @@ class Ppo:
         self.actor.to(self.device)
         self.critic.to(self.device)
 
-        self.rewards_std = deque(maxlen=100)
-        self.rewards_mean = deque(maxlen=100)
+        # INFO
+        self.rewards_std = deque(maxlen=50)
+        self.rewards_mean = deque(maxlen=50)
+        self.scaler = 1
 
     def run(self) -> None:
         t_start = time.perf_counter()
@@ -151,19 +162,21 @@ class Ppo:
                 p_loss = np.mean(policy_losses)
                 ent = np.mean(entropies)
                 explained_variance = np.mean(explained_variances)
+                hours,minutes,seconds = seconds_to_HMS(total_duration)
                 print(f"**************************************************")
                 print(f"Iteration:      {iteration} of {total_iterations}")
                 print(f"Learning rate:  {actor_scheduler.get_last_lr()[0]:0.3e}")
                 print(f"FPS:            {fps}")
                 print(
                     f"Total Steps:    {steps_done} of {int(self.total_steps)}")
-                print(f"Total duration: {total_duration:0.2f} seconds")
+                print(f"Total duration: {hours:02.0f}:{minutes:02.0f}:{seconds:02.0f}")
                 print(f"Average Score:  {score_mean:0.2f} ± {score_err:0.2f}")
                 print(f"Total Loss:     {total_loss:0.3f}")
                 print(f"Value Loss:     {v_loss:0.3f}")
                 print(f"Policy Loss:    {p_loss:0.3f}")
                 print(f"Entropy:        {ent:0.3f}")
                 print(f"E-Var-ratio:    {explained_variance:0.3f}")
+                print(f"Reward Scaler:  {self.scaler:0.3f}")
 
                 summary_duration.append(total_duration)
                 summary_time_step.append(steps_done)
@@ -187,8 +200,8 @@ class Ppo:
     def choose_actions(self, obs: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         state: T.Tensor = T.tensor(obs, dtype=T.float32, device=self.device)
         with T.no_grad():
-            probs: T.Tensor = self.actor(state)
-            values: T.Tensor = self.critic(state)
+            probs: T.Tensor = self.actor.act(state)
+            values: T.Tensor = self.critic.evaluate(state)
 
         action_sample = Categorical(probs)
         actions = action_sample.sample()
@@ -203,7 +216,8 @@ class Ppo:
                 value_samples, reward_samples, terminal_samples = self.memory_buffer.sample(step_based=True)
         
         if self.normalize_rewards:
-            reward_samples = self._normalize_rewards(reward_samples,self.max_reward_norm)
+            reward_samples , self.scaler = self.reward_normalizer.normalize_rewards(reward_samples,terminal_samples,self.max_reward_norm)
+            # reward_samples = self._normalize_rewards(reward_samples,self.max_reward_norm)
 
         advantages_arr , returns_arr = self._calc_adv(reward_samples,value_samples,terminal_samples,last_values)
 
@@ -234,7 +248,7 @@ class Ppo:
         all_log_probs_tensor = T.tensor(all_log_probs_arr, device=self.device)
         all_values_tensor = T.tensor(all_values_arr, device=self.device)
 
-        exaplained_variance = self._calculate_explained_variance(all_values_tensor,all_returns_tensor)
+        exaplained_variance = calculate_explained_variance(all_values_tensor,all_returns_tensor)
 
         for epoch in range(self.n_epochs):
             batch_starts = np.arange(
@@ -252,8 +266,8 @@ class Ppo:
                 returns_batch = all_returns_tensor[batch]
 
                 # get predictions for current batch of states
-                probs: T.Tensor = self.actor(states_tensor)
-                critic_values: T.Tensor = self.critic(states_tensor)
+                probs: T.Tensor = self.actor.act(states_tensor)
+                critic_values: T.Tensor = self.critic.evaluate(states_tensor)
                 critic_values = critic_values.squeeze()
 
                 # get entropy
@@ -351,11 +365,3 @@ class Ppo:
         self.rewards_mean.append(current_rewards_mean)
         rewards = np.clip(rewards /(np.mean(self.rewards_std)+1e-8),-max_norm,max_norm)
         return rewards
-    
-    @staticmethod
-    def _calculate_explained_variance(prediction:T.Tensor,target:T.Tensor)->float:
-        assert prediction.ndim == 1 and target.ndim == 1
-        target_var = target.var()+1e-8
-        unexplained_var_ratio = (target-prediction).var()/target_var
-        explained_var_ratio = 1 - unexplained_var_ratio
-        return explained_var_ratio.cpu().item()

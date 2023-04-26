@@ -6,8 +6,10 @@ import torch as T
 import matplotlib.pyplot as plt
 from collections import deque
 from torch.nn.utils.clip_grad import clip_grad_norm_
-from axel.common.networks import ActorCriticNetwork, SmallActorCriticNetwork
+from axel.common.networks import CnnActorCriticNetwork, SmallActorCriticNetwork,ImpalaActorCritic
+from axel.common.running_normalizer import RunningNormalizer
 from ..ppo.memory_buffer import MemoryBuffer
+from axel.common.utils import calculate_explained_variance, seconds_to_HMS
 
 
 class Pop3d:
@@ -26,7 +28,8 @@ class Pop3d:
                  normalize_rewards=False,
                  normalize_adv=False,
                  max_reward_norm=3,
-                 decay_lr=True
+                 decay_lr=True,
+                 residual = True
                  ) -> None:
 
         # Environment info
@@ -57,13 +60,17 @@ class Pop3d:
         self.normalize_adv = normalize_adv
         self.normalize_rewards = normalize_rewards
         self.max_reward_norm = max_reward_norm
+        self.rewards_normalizer = RunningNormalizer(maxlen=100,gamma=gamma)
 
         self.memory_buffer = MemoryBuffer(
             self.vec_env.single_observation_space.shape, self.n_workers, step_size)
 
         if len(self.observation_shape) > 2:
-            self.network = ActorCriticNetwork(
-                self.vec_env.single_observation_space.shape, self.n_game_actions)
+            if residual:
+                self.network = ImpalaActorCritic(self.vec_env.single_observation_space.shape, self.n_game_actions)
+            else:
+                self.network = CnnActorCriticNetwork(
+                    self.vec_env.single_observation_space.shape, self.n_game_actions)
 
         else:
             self.network = SmallActorCriticNetwork(
@@ -74,15 +81,15 @@ class Pop3d:
         self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
         self.network.to(self.device)
 
+        # INFO
         self.rewards_std = deque(maxlen=100)
+        self.scaler = 1
 
     def run(self) -> None:
         t_start = time.perf_counter()
 
-        observations: np.ndarray
-        infos: dict
-
-        observations, infos = self.vec_env.reset()
+        z : tuple[np.ndarray,dict] = self.vec_env.reset()
+        observations, infos = z
         total_scores = np.zeros((self.n_workers,), dtype=np.float32)
         s = deque([], 100)
 
@@ -104,7 +111,9 @@ class Pop3d:
         policy_losses = deque(maxlen=100)
         entropies = deque(maxlen=100)
         total_losses = deque(maxlen=100)
+        explained_variances = deque(maxlen=100)
         for iteration in range(1, total_iterations+1):
+            self.network.eval()
             actions, log_probs, values = self.choose_actions(observations)
             new_observations, rewards, dones, truncs, infos = self.vec_env.step(
                 actions=actions)
@@ -120,17 +129,18 @@ class Pop3d:
             if iteration % self.step_size == 0:
                 last_values_tensor: T.Tensor
                 with T.no_grad():
-                    _, last_values_tensor = self.network(
+                    last_values_tensor = self.network.evaluate(
                         T.tensor(observations, dtype=T.float32, device=self.device))
                     last_values_ar: np.ndarray = last_values_tensor.squeeze().cpu().numpy()
 
-                v_loss, p_loss, ent, total_loss = self.train_network(
+                v_loss, p_loss, ent, total_loss , explained_variance = self.train_network(
                     last_values_ar)
 
                 value_losses.append(v_loss)
                 policy_losses.append(p_loss)
                 entropies.append(ent)
                 total_losses.append(total_loss)
+                explained_variances.append(explained_variance)
 
                 self.memory_buffer.reset()
                 self.network.save_model(os.path.join("tmp", "network.pt"))
@@ -150,6 +160,7 @@ class Pop3d:
                 p_loss: float = np.mean(policy_losses)
                 ent: float = np.mean(entropies)
                 total_loss: float = np.mean(total_losses)
+                hours,minutes,seconds =  seconds_to_HMS(total_duration)
                 print(f"**************************************************")
                 print(
                     f"Iteration:      {iteration} of {int(total_iterations)}")
@@ -157,13 +168,14 @@ class Pop3d:
                     f"learning rate:  {network_scheduler.get_last_lr()[0]:0.3e}")
                 print(
                     f"Total Steps:    {steps_done} of {int(self.total_steps)}")
-                print(f"Total duration: {total_duration:0.2f} seconds")
+                print(f"Total duration: {hours:02.0f}:{minutes:02.0f}:{seconds:02.0f}")
                 print(f"Average Score:  {score_mean:0.2f} ± {score_err:0.2f}")
                 print(f"Average FPS:    {fps}")
                 print(f"Total Loss:     {total_loss:0.3f}")
                 print(f"Value Loss:     {v_loss:0.3f}")
                 print(f"Policy Loss:    {p_loss:0.3f}")
                 print(f"Entropy:        {ent:0.3f}")
+                print(f"Reward Scaler:  {self.scaler:0.3f}")
                 value_losses.clear()
                 entropies.clear()
                 policy_losses.clear()
@@ -193,7 +205,7 @@ class Pop3d:
         probs: T.Tensor
         values: T.Tensor
         with T.no_grad():
-            probs, values = self.network(observation_tensor)
+            probs, values = self.network.act_and_eval(observation_tensor)
         action_sample = T.distributions.Categorical(probs)
         actions = action_sample.sample()
         log_probs: T.Tensor = action_sample.log_prob(actions)
@@ -201,6 +213,7 @@ class Pop3d:
 
     def train_network(self, last_values: np.ndarray):
         # self.network.train
+        self.network.train()
         sample_size = self.n_workers*self.step_size
         batch_size = (sample_size) // self.n_batches
 
@@ -209,8 +222,7 @@ class Pop3d:
                 step_based=True)
 
         if self.normalize_rewards:
-            reward_samples = self._normalize_rewards(
-                reward_samples, self.max_reward_norm)
+            reward_samples ,self.scaler = self.rewards_normalizer.normalize_rewards(reward_samples,terminal_samples,self.max_reward_norm)
 
         all_advantages_ar, all_returns_ar = self._calc_adv(
             reward_samples, value_samples, terminal_samples, last_values)
@@ -248,6 +260,8 @@ class Pop3d:
             (self.n_epochs, self.n_batches), dtype=T.float32, device=self.device)
         total_losses_info = T.zeros(
             (self.n_epochs, self.n_batches), dtype=T.float32, device=self.device)
+        
+        explained_variance = calculate_explained_variance(all_values_tensor,all_returns_tensor)
         for epoch in range(self.n_epochs):
             batch_starts = np.arange(
                 0, self.n_workers*self.step_size, batch_size)
@@ -262,8 +276,7 @@ class Pop3d:
                 advantages_batch = all_advantages_tensor[batch]
                 returns_batch = all_returns_tensor[batch]
 
-                z: tuple[T.Tensor, T.Tensor] = self.network(observation_batch)
-                probs, predicted_values = z
+                probs, predicted_values  = self.network.act_and_eval(observation_batch)
                 predicted_values = predicted_values.squeeze()
 
                 # get entropy
@@ -307,7 +320,7 @@ class Pop3d:
         mean_entropy = entropy_info.flatten().mean()
         mean_total_loss = total_losses_info.flatten().mean()
 
-        return mean_value_loss.cpu().item(), mean_policy_loss.cpu().item(), mean_entropy.cpu().item(), mean_total_loss.cpu().item()
+        return mean_value_loss.cpu().item(), mean_policy_loss.cpu().item(), mean_entropy.cpu().item(), mean_total_loss.cpu().item(),explained_variance
 
     def _calc_adv(self, rewards: np.ndarray, values: np.ndarray, terminals: np.ndarray, last_values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         sample_size = len(values)

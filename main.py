@@ -6,6 +6,7 @@ from axel.ppo.ppo import Ppo
 from axel.pop3d.pop3d import Pop3d
 from axel.ppg.ppg import Ppg
 from axel.common.env_wrappers import apply_wrappers
+from axel.ppo.recurrent_ppo import RecurrentPPO
 from axel.trainer_builder import TrainerBuilder
 
 
@@ -59,6 +60,9 @@ def train_ppg():
                 .n_aux_batches(16)
                 .learning_rate(5e-4)
                 .enable_reward_normalization(3)
+                .gamma(0.99)
+                .disable_lr_decay()
+                .vec_env(vec_env)
                 .disable_advantage_normalization()
                 .entropy_coef(0)
                 .build())
@@ -141,8 +145,14 @@ def train_pop3d_cartpole():
             )
     pop3d.run()
 
+
+def train_recurrent_ppo():
+    envs_fns = [get_env for _ in range(8)]
+    ppo = RecurrentPPO(game_fns=envs_fns)
+    ppo.run()
 def main():
-    train_pop3d()
+    # train_pop3d()
+    train_recurrent_ppo()
     # train_ppg()
     # train_ppo()
     # train_ppg_cartpole()

@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
+from typing import Sequence
 import torch as T
+from torch.nn import functional as F
 import torch.nn as nn
 import numpy as np
 
@@ -21,6 +23,7 @@ class NetworkBase(ABC):
         Loads model from path
         '''
         raise NotImplementedError("Calling abstract load_model")
+
 
 
 class PytorchNetwork(nn.Module, NetworkBase):
@@ -45,8 +48,33 @@ class PytorchNetwork(nn.Module, NetworkBase):
         except:
             print(f'could not load nn from {self.last_path}')
 
-
 class ActorNetwork(PytorchNetwork):
+    def __init__(self) -> None:
+        super().__init__()
+    
+    @abstractmethod
+    def act(self,observation:T.Tensor)->T.Tensor:
+        raise NotImplementedError()
+
+class CriticNetwork(PytorchNetwork):
+    def __init__(self) -> None:
+        super().__init__()
+    
+    @abstractmethod
+    def evaluate(self,observation:T.Tensor)->T.Tensor:
+        raise NotImplementedError()
+
+class ActorCriticNetwork(ActorNetwork,CriticNetwork):
+    def __init__(self) -> None:
+        super().__init__()
+    
+    @abstractmethod
+    def act_and_eval(self,observation:T.Tensor)->tuple[T.Tensor,T.Tensor]:
+        raise NotImplementedError()
+
+
+
+class CnnActorNetwork(ActorNetwork):
     def __init__(self, observation_space: np.ndarray, n_actions: int) -> None:
         super().__init__()
 
@@ -72,8 +100,11 @@ class ActorNetwork(PytorchNetwork):
         probs: T.Tensor = self._probs(observation)
         return probs
 
+    def act(self, observation: T.Tensor) -> T.Tensor:
+        return self(observation)
 
-class CriticNetwork(PytorchNetwork):
+
+class CnnCriticNetwork(CriticNetwork):
     def __init__(self, observation_space: np.ndarray) -> None:
         super().__init__()
         self._v = nn.Sequential(
@@ -92,8 +123,11 @@ class CriticNetwork(PytorchNetwork):
         v: T.Tensor = self._v(observation)
         return v
 
+    def evaluate(self, observation: T.Tensor) -> T.Tensor:
+        return self(observation)
 
-class ActorCriticNetwork(PytorchNetwork):
+
+class CnnActorCriticNetwork(ActorCriticNetwork):
     def __init__(self, observation_space: np.ndarray, n_actions: int) -> None:
         super().__init__()
         self._shared = nn.Sequential(
@@ -120,8 +154,20 @@ class ActorCriticNetwork(PytorchNetwork):
         v: T.Tensor = self._v(shared)
         return probs, v
 
+    def act(self, observation: T.Tensor) -> T.Tensor:
+        prob,_ = self(observation)
+        return prob
+    
+    def evaluate(self, observation: T.Tensor) -> T.Tensor:
+        _,v = self(observation)
+        return v
 
-class SmallActorNetwork(PytorchNetwork):
+    def act_and_eval(self, observation: T.Tensor) -> tuple[T.Tensor, T.Tensor]:
+        prob,v = self(observation)
+        return prob,v
+
+
+class SmallActorNetwork(ActorNetwork):
     def __init__(self, n_actions, input_dims,fc1_dims=256, fc2_dims=256):
         super(SmallActorNetwork, self).__init__()
 
@@ -138,11 +184,13 @@ class SmallActorNetwork(PytorchNetwork):
         self.to(self.device)
 
     def forward(self, state):
-        dist = self.actor(state)
-        return dist
+        probs = self.actor(state)
+        return probs
 
+    def act(self, observation: T.Tensor) -> T.Tensor:
+        return self(observation)
 
-class SmallCriticNetwork(PytorchNetwork):
+class SmallCriticNetwork(CriticNetwork):
     def __init__(self, input_dims, fc1_dims=256, fc2_dims=256):
         super(SmallCriticNetwork, self).__init__()
 
@@ -159,8 +207,11 @@ class SmallCriticNetwork(PytorchNetwork):
     def forward(self, state):
         value = self.critic(state)
         return value
+    
+    def evaluate(self, observation: T.Tensor) -> T.Tensor:
+        return self(observation)
 
-class SmallActorCriticNetwork(PytorchNetwork):
+class SmallActorCriticNetwork(ActorCriticNetwork):
     def __init__(self, n_actions, input_dims,fc1_dims=256, fc2_dims=256):
         super(SmallActorCriticNetwork, self).__init__()
         self.actor = nn.Sequential(
@@ -185,3 +236,249 @@ class SmallActorCriticNetwork(PytorchNetwork):
         dist = self.actor(state)
         val = self.critic(state)
         return dist,val
+
+    def act(self, observation: T.Tensor) -> T.Tensor:
+        prob,_ =  self(observation)
+        return prob
+    def evaluate(self, observation: T.Tensor) -> T.Tensor:
+        _,v =  self(observation)
+        return v
+    def act_and_eval(self, observation: T.Tensor) -> tuple[T.Tensor, T.Tensor]:
+        prob,v = self(observation)
+        return prob,v
+
+def intprod(xs):
+    out = 1
+    for x in xs:
+        out*=x
+    return out
+def NormConv2d(*args,scale=1,**kwargs):
+    out = nn.Conv2d(*args,**kwargs)
+    out.weight.data *= scale/out.weight.norm(dim=(1,2,3),p=2,keepdim=True)
+    if kwargs.get("bias",True):
+        out.bias.data*=0
+    return out
+
+def NormLinear(*args,scale=1.0,**kwargs):
+    out = T.nn.Linear(*args,**kwargs)
+    out.weight.data *= scale/out.weight.norm(dim=1,p=2,keepdim=True)
+    if kwargs.get("bias",True):
+        out.bias.data *= 0
+    return out
+
+def sequential(layers, x, *args, diag_name=None):
+    for (i, layer) in enumerate(layers):
+        x = layer(x, *args)
+    return x
+
+class CnnBasicBlock(nn.Module):
+    def __init__(self,inchan,scale=1,batchnorm=False) -> None:
+        super().__init__()
+        self.inchan = inchan
+        self.batchnorm = batchnorm
+        s = scale**0.5
+        self.conv0 = NormConv2d(self.inchan,self.inchan,3,padding=1,scale=s)
+        self.conv1 = NormConv2d(self.inchan,self.inchan,3,padding=1,scale=s)
+        if self.batchnorm:
+            self.bn0 = nn.BatchNorm2d(self.inchan)
+            self.bn1 = nn.BatchNorm2d(self.inchan)
+    
+    def residual(self,x):
+        if getattr(self,"batch_norm",False):
+            x = self.bn0(x)
+        x = F.relu(x,inplace=False)
+        x = self.conv0(x)
+        if getattr(self,"batch_norm",False):
+            x = self.bn1(x)
+        x = F.relu(x,inplace=True)
+        x = self.conv1(x)
+        return x
+
+    def forward(self,x):
+        return x + self.residual(x)
+
+class CnnDownStack(nn.Module):
+    def __init__(self,inchan,nblocks,outchan,scale=1,pool=True,**kwargs) -> None:
+        super().__init__()
+
+        self.inchan = inchan
+        self.outchan=outchan
+        self.pool = pool
+
+        self.firstconv = NormConv2d(inchan,outchan,3,padding=1)
+        s = scale/(nblocks**0.5)
+        self.blocks = T.nn.ModuleList([CnnBasicBlock(outchan,scale=s,**kwargs) for _ in range(nblocks)])
+    
+
+    def forward(self,x):
+        x = self.firstconv(x)
+        if getattr(self,"pool",True):
+            x = T.max_pool2d(x,kernel_size=3,stride=2,padding=1)
+        
+        for block in self.blocks:
+            x = block(x)
+        return x
+
+    def output_shape(self,inshape):
+        c,h,w = inshape
+
+        assert c == self.inchan
+        if getattr(self,"pool",True):
+            return (self.outchan,(h+1)//2,(w+1)//2)
+        else:
+            return (self.outchan,h,w)
+
+class ImpalaCNN(nn.Module):
+    name = "ImpalaCNN"
+    def __init__(self,inshape,chans,outsize,scale_ob,nblock,final_relu=True,**kwargs) -> None:
+        super().__init__()
+        self.scale_ob = scale_ob
+        # h,w,c = inshape
+        c,h,w = inshape
+        curshape = (c,h,w)
+
+        s = 1/((len(chans))**0.5)
+        self.stacks = nn.ModuleList()
+        for outchan in chans:
+            stack = CnnDownStack(curshape[0],nblocks=nblock,outchan=outchan,scale=s,**kwargs)
+            self.stacks.append(stack)
+            curshape = stack.output_shape(curshape)
+        
+        self.dense = NormLinear(intprod(curshape),outsize,scale=1.4)
+        self.outsize = outsize
+        self.final_relu = final_relu
+    
+    def forward(self,x:T.Tensor):
+        x = x.to(T.float32) / self.scale_ob
+
+        b = x.shape[:-3]
+        o = x.shape[-3:]
+        o = [*b,*o]
+        x = x.reshape(*o)
+        x = sequential(self.stacks,x,diag_name=self.name)
+        x = x.reshape(*b,*x.shape[1:])
+        *batch_shape , h,w,c = x.shape 
+        x = x.reshape(*batch_shape,h*w*c)
+        x = T.relu(x)
+        x = self.dense(x)
+        if self.final_relu:
+            x = T.relu(x)
+        return x
+
+class ImpalaEncoder(nn.Module):
+    def __init__(self,inshape,outsize=256,chans=(16,32,32),scale_ob=255.0,nblocks=2,**kwargs) -> None:
+        super().__init__()
+        self.cnn = ImpalaCNN(
+            inshape=inshape,
+            chans=chans,
+            scale_ob=scale_ob,
+            nblock=nblocks,
+            outsize=outsize,
+            **kwargs
+        )
+    
+    def forward(self,x):
+        x = self.cnn(x)
+        return x
+
+class ImpalaActorCritic(ActorCriticNetwork):
+    def __init__(self,observations_shape,n_actions:int) -> None:
+        super().__init__()
+        outsize = 256
+        self.encoder = ImpalaEncoder(inshape=observations_shape,scale_ob=1.0,outsize=outsize)
+        self.pi_head = NormLinear(outsize,n_actions,0.1)
+        self.vi_head = NormLinear(outsize,1,0.1)
+    
+    def forward(self,x):
+        x = self.encoder(x)
+        logits:T.Tensor = self.pi_head(x)
+        probs = logits.softmax(dim=-1)
+        v = self.vi_head(x)
+        return probs , v
+
+    def act(self, observation: T.Tensor) -> T.Tensor:
+        prob,_ = self(observation)
+        return prob
+    def evaluate(self, observation: T.Tensor) -> T.Tensor:
+        _,v = self(observation)
+        return v
+    def act_and_eval(self, observation: T.Tensor) -> tuple[T.Tensor, T.Tensor]:
+        prob,v = self(observation)
+        return prob,v
+    
+class ImpalaCritic(CriticNetwork):
+    def __init__(self,observations_shape) -> None:
+        super().__init__()
+        outsize = 256
+        self.encoder = ImpalaEncoder(inshape=observations_shape,scale_ob=1.0,outsize=outsize)
+        self.pi_head = NormLinear(outsize,1,0.1)
+    def forward(self,x):
+        x = self.encoder(x)
+        x:T.Tensor = self.pi_head(x)
+        return x
+    def evaluate(self, observation: T.Tensor) -> T.Tensor:
+        x = self(observation)
+        return x
+
+class RnnActorCriticNetwork(PytorchNetwork):
+    def __init__(self,observation_shape:tuple,n_actions:int) -> None:
+        super().__init__()
+        self.lstmout = 256
+        self.encoder = ImpalaEncoder(observation_shape,scale_ob=1.0,outsize=256)
+        self.lstm = nn.LSTMCell(256,self.lstmout)
+        self.pi_head = nn.Sequential(
+            nn.Linear(self.lstmout,self.lstmout),
+            nn.ReLU(),
+            nn.Linear(self.lstmout,n_actions)
+        )
+        self.v_head = nn.Sequential(
+            nn.Linear(self.lstmout,self.lstmout),
+            nn.ReLU(),
+            nn.Linear(self.lstmout,1)
+        )
+
+        self.device = T.device("cuda:0" if T.cuda.is_available() else "cpu")
+        self.encoder.to(self.device)
+        self.lstm.to(self.device)
+        self.pi_head.to(self.device)
+        self.v_head.to(self.device)
+
+
+        self.ht0 = T.nn.Parameter(T.zeros(1,self.lstmout,dtype=T.float32,device=self.device),requires_grad=True)
+        self.ct0 = T.nn.Parameter(T.zeros(1,self.lstmout,dtype=T.float32,device=self.device),requires_grad=True)
+    
+    def get_initials(self,n=1):
+        ht = self.ht0.expand((n,self.lstmout))
+        ct = self.ct0.expand((n,self.lstmout))
+        return ht,ct
+
+    def forward(self,obs:T.Tensor,htc:tuple[T.Tensor,T.Tensor]):
+        x = self.encoder(obs)
+        ht,ct = htc
+        ht,ct = self.lstm(x,(ht,ct))
+        v = self.v_head(ht)
+        logits:T.Tensor = self.pi_head(ht)
+        probs = logits.softmax(dim=-1)
+        return probs,v,ht,ct
+    
+    def encode(self,x:T.Tensor):
+        t,w =  x.shape[:-3]
+        x = x.reshape(t*w,*x.shape[-3:])
+        x = self.encoder(x)
+        x = x.reshape(t,w,*x.shape[1:])
+        return x
+    
+    def single(self,x:T.Tensor,ht:T.Tensor,ct:T.Tensor):
+        ht,ct = self.lstm(x,(ht,ct))
+        v = self.v_head(ht)
+        logits:T.Tensor = self.pi_head(ht)
+        probs = logits.softmax(dim=-1)
+        return probs,v,ht,ct
+
+    def stateless_forward(self,obs:T.Tensor):
+        n = obs.size(1)
+        ht,ct = self.get_initials(n)
+        return self.predict(obs,(ht,ct))
+    
+    def predict(self,obs:T.Tensor,ht:T.Tensor,ct:T.Tensor)->tuple[T.Tensor,T.Tensor,T.Tensor,T.Tensor]:
+        return self(obs,(ht,ct))
