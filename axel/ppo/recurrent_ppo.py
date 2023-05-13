@@ -8,7 +8,7 @@ import torch as T
 import numpy as np
 from torch.nn.utils.clip_grad import clip_grad_norm_
 from typing import Callable, Sequence
-from axel.common.networks import ImpalaEncoder, RnnActorCriticNetwork
+from axel.common.networks import ImpalaEncoder, ImpalaRnnActorCriticNetwork, SmallRnnActorCriticNetwork
 from axel.common.running_normalizer import RunningNormalizer
 from axel.common.utils import calculate_explained_variance, seconds_to_HMS
 from axel.ppo.memory_buffer import MemoryBuffer
@@ -33,7 +33,8 @@ class RecurrentPPO():
                  decay_lr=True,
                  ) -> None:
         self.vec_env = AsyncVectorEnv(game_fns)
-        self.network = RnnActorCriticNetwork(self.vec_env.single_observation_space.shape,self.vec_env.single_action_space.n)
+        # self.network = ImpalaRnnActorCriticNetwork(self.vec_env.single_observation_space.shape,self.vec_env.single_action_space.n)
+        self.network = SmallRnnActorCriticNetwork(self.vec_env.single_observation_space.shape,self.vec_env.single_action_space.n)
         self.encoder = self.network.encoder
 
         self.n_workers = self.vec_env.num_envs
@@ -85,6 +86,8 @@ class RecurrentPPO():
         workers_score = np.zeros((self.n_workers,))
         current_steps = 0
         min_steps = self.total_steps
+
+        
         while current_steps< min_steps:
             all_states = []
             all_probs = []
@@ -94,7 +97,6 @@ class RecurrentPPO():
             all_rewards = []
             all_hts = []
             all_cts = []
-
             for i in range(horizon):
                 obs_t = T.tensor(states,dtype=T.float32,device=device)
 
@@ -155,8 +157,14 @@ class RecurrentPPO():
             all_adv_ar , all_returns_ar = self.calculate_adv(all_rewards_ar,all_values_ar,all_terminals_ar,last_values_ar)
 
             explained_variance = calculate_explained_variance(all_values_ar,all_returns_ar)
-
-            total_loss , actor_loss , critic_loss , entropy = self.train_network(
+            if self.decay_lr:
+                decay_rate = 0.1
+                decay =  decay_rate ** (current_steps / min_steps)
+                lr = self.lr * decay
+                for g in self.optim.param_groups:
+                    g['lr'] = lr
+                self.optim.param_groups
+            total_loss , actor_loss , critic_loss , entropy ,approx_kl= self.train_network(
                 all_states_ar,all_actions_ar,all_probs_ar,all_adv_ar,all_returns_ar,all_terminals_ar,all_hts_t,all_cts_t)
             
             if current_steps >= next_log:
@@ -173,6 +181,7 @@ class RecurrentPPO():
                 print(f"[INFO] Step: {current_steps+1} of {min_steps}")
                 print(f"[INFO] Duration: {hours:02.0f}:{minutes:02.0f}:{seconds:02.0f}")
                 print(f"[INFO] FPS: {fps}")
+                print(f"[INFO] Learning Rate: {self.optim.param_groups[0]['lr']:0.3e}")
                 print(f"[INFO] Average Score: {score_mean:0.3f} ± {score_err:0.3f}")
                 print(f"[INFO] Scaler: {scaler:0.3f}")
                 print(f"[INFO] Total Loss: {total_loss :0.3f}")
@@ -180,13 +189,14 @@ class RecurrentPPO():
                 print(f"[INFO] Critic Loss: {critic_loss :0.3f}")
                 print(f"[INFO] Entropy: {entropy :0.3f}")
                 print(f"[INFO] Explained Variance: {explained_variance :0.3f}")
+                print(f"[INFO] Approx KL: {approx_kl :0.3f}")
 
             T.save(
                 {"network" : self.network.state_dict(),
                 "reward_normalizer" : self.reward_normalizer,
                 "optimizer" : self.optim
                 },os.path.join("tmp","ppo_recurrent.pt"))
-            self.network.save_model(os.path.join("tmp","ppo_recurrent_network.py"))
+            self.network.save_model(os.path.join("tmp","ppo_recurrent_network.pt"))
         
     def calculate_adv(
             self,
@@ -245,6 +255,8 @@ class RecurrentPPO():
         actor_losses = []
         critic_losses = []
         entropies = []
+        # approx_kl_t = T.zeros((1,),device=self.device)
+        approx_kls = []
         
         for epoch in range(n_epochs):
             batch_starts = np.arange(0,sample_size,batch_size)
@@ -298,6 +310,8 @@ class RecurrentPPO():
                 clipped_ratio = prob_ratio.clamp(1-self.policy_clip,1+self.policy_clip)
                 weighted_clipped_prob = clipped_ratio * adv_batch
                 actor_loss = -T.min(weighted_prob,weighted_clipped_prob).mean()
+                approx_kl_t = ((prob_ratio - 1) - T.log(prob_ratio)).mean()
+                approx_kls.append(approx_kl_t)
 
                 # critic loss
                 critic_loss = (0.5*(returns_batch - v)**2).mean()
@@ -324,7 +338,8 @@ class RecurrentPPO():
             mean_critic_loss = T.stack(critic_losses).mean().cpu().item()
             mean_actor_loss = T.stack(actor_losses).mean().cpu().item()
             mean_entropy = T.stack(entropies).mean().cpu().item()
-        return mean_total_loss,mean_actor_loss,mean_critic_loss,mean_entropy
+            approx_kl = T.stack(approx_kls).mean().cpu().item()
+        return mean_total_loss,mean_actor_loss,mean_critic_loss,mean_entropy,approx_kl
 
 
     def __del__(self):

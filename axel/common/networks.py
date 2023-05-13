@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import axel.common.torch_utils as tu
 from typing import Sequence
 import torch as T
 from torch.nn import functional as F
@@ -247,25 +248,6 @@ class SmallActorCriticNetwork(ActorCriticNetwork):
         prob,v = self(observation)
         return prob,v
 
-def intprod(xs):
-    out = 1
-    for x in xs:
-        out*=x
-    return out
-def NormConv2d(*args,scale=1,**kwargs):
-    out = nn.Conv2d(*args,**kwargs)
-    out.weight.data *= scale/out.weight.norm(dim=(1,2,3),p=2,keepdim=True)
-    if kwargs.get("bias",True):
-        out.bias.data*=0
-    return out
-
-def NormLinear(*args,scale=1.0,**kwargs):
-    out = T.nn.Linear(*args,**kwargs)
-    out.weight.data *= scale/out.weight.norm(dim=1,p=2,keepdim=True)
-    if kwargs.get("bias",True):
-        out.bias.data *= 0
-    return out
-
 def sequential(layers, x, *args, diag_name=None):
     for (i, layer) in enumerate(layers):
         x = layer(x, *args)
@@ -277,25 +259,26 @@ class CnnBasicBlock(nn.Module):
         self.inchan = inchan
         self.batchnorm = batchnorm
         s = scale**0.5
-        self.conv0 = NormConv2d(self.inchan,self.inchan,3,padding=1,scale=s)
-        self.conv1 = NormConv2d(self.inchan,self.inchan,3,padding=1,scale=s)
+        self.conv0 = tu.NormConv2d(T.nn.Conv2d(self.inchan,self.inchan,3,padding=1),scale=s)
+        self.conv1 = tu.NormConv2d(T.nn.Conv2d(self.inchan,self.inchan,3,padding=1),scale=s)
         if self.batchnorm:
             self.bn0 = nn.BatchNorm2d(self.inchan)
             self.bn1 = nn.BatchNorm2d(self.inchan)
-    
-    def residual(self,x):
-        if getattr(self,"batch_norm",False):
-            x = self.bn0(x)
-        x = F.relu(x,inplace=False)
-        x = self.conv0(x)
-        if getattr(self,"batch_norm",False):
-            x = self.bn1(x)
-        x = F.relu(x,inplace=True)
-        x = self.conv1(x)
-        return x
-
-    def forward(self,x):
-        return x + self.residual(x)
+        self.res  = self._res(batchnorm)
+        
+    def _res(self,batchnorm:bool):
+        seq = nn.Sequential()
+        if batchnorm:
+            seq.append(self.bn0)
+        seq.append(nn.ReLU())
+        seq.append(self.conv0)
+        if batchnorm:
+            seq.append(self.bn1)
+        seq.append(nn.ReLU(inplace=True))
+        seq.append(self.conv1)
+        return seq
+    def forward(self,x:T.Tensor):
+        return x + self.res(x)
 
 class CnnDownStack(nn.Module):
     def __init__(self,inchan,nblocks,outchan,scale=1,pool=True,**kwargs) -> None:
@@ -305,18 +288,18 @@ class CnnDownStack(nn.Module):
         self.outchan=outchan
         self.pool = pool
 
-        self.firstconv = NormConv2d(inchan,outchan,3,padding=1)
         s = scale/(nblocks**0.5)
-        self.blocks = T.nn.ModuleList([CnnBasicBlock(outchan,scale=s,**kwargs) for _ in range(nblocks)])
-    
+        self.first = nn.Sequential(
+            tu.NormConv2d(nn.Conv2d(inchan,outchan,3,padding=1)))
+        if self.pool:
+            self.first.append(nn.MaxPool2d(kernel_size=3,stride=2,padding=1))
+        self.blocks = nn.Sequential(
+            *[CnnBasicBlock(outchan,scale=s,**kwargs) for _ in range(nblocks)]
+        )
 
     def forward(self,x):
-        x = self.firstconv(x)
-        if getattr(self,"pool",True):
-            x = T.max_pool2d(x,kernel_size=3,stride=2,padding=1)
-        
-        for block in self.blocks:
-            x = block(x)
+        x = self.first(x)
+        x = self.blocks(x)
         return x
 
     def output_shape(self,inshape):
@@ -333,7 +316,6 @@ class ImpalaCNN(nn.Module):
     def __init__(self,inshape,chans,outsize,scale_ob,nblock,final_relu=True,**kwargs) -> None:
         super().__init__()
         self.scale_ob = scale_ob
-        # h,w,c = inshape
         c,h,w = inshape
         curshape = (c,h,w)
 
@@ -343,8 +325,8 @@ class ImpalaCNN(nn.Module):
             stack = CnnDownStack(curshape[0],nblocks=nblock,outchan=outchan,scale=s,**kwargs)
             self.stacks.append(stack)
             curshape = stack.output_shape(curshape)
-        
-        self.dense = NormLinear(intprod(curshape),outsize,scale=1.4)
+        self.seq_stacks = nn.Sequential(*self.stacks)
+        self.dense = tu.NormLinear(nn.Linear(tu.intprod(curshape),outsize),scale=1.4)
         self.outsize = outsize
         self.final_relu = final_relu
     
@@ -355,7 +337,8 @@ class ImpalaCNN(nn.Module):
         o = x.shape[-3:]
         o = [*b,*o]
         x = x.reshape(*o)
-        x = sequential(self.stacks,x,diag_name=self.name)
+        # x = sequential(self.stacks,x,diag_name=self.name)
+        x = self.seq_stacks(x)
         x = x.reshape(*b,*x.shape[1:])
         *batch_shape , h,w,c = x.shape 
         x = x.reshape(*batch_shape,h*w*c)
@@ -386,8 +369,8 @@ class ImpalaActorCritic(ActorCriticNetwork):
         super().__init__()
         outsize = 256
         self.encoder = ImpalaEncoder(inshape=observations_shape,scale_ob=1.0,outsize=outsize)
-        self.pi_head = NormLinear(outsize,n_actions,0.1)
-        self.vi_head = NormLinear(outsize,1,0.1)
+        self.pi_head = tu.NormLinear(nn.Linear(outsize,n_actions),scale=0.1)
+        self.vi_head = tu.NormLinear(nn.Linear(outsize,1),scale=0.1)
     
     def forward(self,x):
         x = self.encoder(x)
@@ -411,7 +394,7 @@ class ImpalaCritic(CriticNetwork):
         super().__init__()
         outsize = 256
         self.encoder = ImpalaEncoder(inshape=observations_shape,scale_ob=1.0,outsize=outsize)
-        self.pi_head = NormLinear(outsize,1,0.1)
+        self.pi_head = tu.NormLinear(nn.Linear(outsize,1),scale=0.1)
     def forward(self,x):
         x = self.encoder(x)
         x:T.Tensor = self.pi_head(x)
@@ -420,20 +403,109 @@ class ImpalaCritic(CriticNetwork):
         x = self(observation)
         return x
 
+
 class RnnActorCriticNetwork(PytorchNetwork):
+    def __init__(self) -> None:
+        super().__init__()
+
+    @abstractmethod
+    def get_initials(self,n:int)->tuple[T.Tensor,T.Tensor]:
+        raise NotImplementedError()
+    
+    @abstractmethod
+    def encode(self,x:T.Tensor)->tuple[T.Tensor]:
+        raise NotImplementedError()
+
+    @abstractmethod
+    def single(self,x:T.Tensor,ht:T.Tensor,ct:T.Tensor)->tuple[T.Tensor,T.Tensor,T.Tensor,T.Tensor]:
+        raise NotImplementedError()
+    
+    @abstractmethod
+    def predict(self,x:T.Tensor,ht:T.Tensor,ct:T.Tensor)->tuple[T.Tensor,T.Tensor,T.Tensor,T.Tensor]:
+        raise NotImplementedError()
+
+
+class ImpalaRnnActorCriticNetwork(RnnActorCriticNetwork):
     def __init__(self,observation_shape:tuple,n_actions:int) -> None:
         super().__init__()
         self.lstmout = 256
         self.encoder = ImpalaEncoder(observation_shape,scale_ob=1.0,outsize=256)
         self.lstm = nn.LSTMCell(256,self.lstmout)
         self.pi_head = nn.Sequential(
-            nn.Linear(self.lstmout,self.lstmout),
-            nn.ReLU(),
             nn.Linear(self.lstmout,n_actions)
         )
         self.v_head = nn.Sequential(
-            nn.Linear(self.lstmout,self.lstmout),
+            nn.Linear(self.lstmout,1)
+        )
+
+        self.device = T.device("cuda:0" if T.cuda.is_available() else "cpu")
+        self.encoder.to(self.device)
+        self.lstm.to(self.device)
+        self.pi_head.to(self.device)
+        self.v_head.to(self.device)
+
+
+        self.ht0 = T.nn.Parameter(T.zeros(1,self.lstmout,dtype=T.float32,device=self.device),requires_grad=True)
+        self.ct0 = T.nn.Parameter(T.zeros(1,self.lstmout,dtype=T.float32,device=self.device),requires_grad=True)
+    
+    def get_initials(self,n=1):
+        ht = self.ht0.expand((n,self.lstmout))
+        ct = self.ct0.expand((n,self.lstmout))
+        return ht,ct
+
+    def forward(self,obs:T.Tensor,htc:tuple[T.Tensor,T.Tensor]):
+        x = self.encoder(obs)
+        ht,ct = htc
+        ht,ct = self.lstm(x,(ht,ct))
+        v = self.v_head(ht)
+        logits:T.Tensor = self.pi_head(ht)
+        probs = logits.softmax(dim=-1)
+        return probs,v,ht,ct
+    
+    def encode(self,x:T.Tensor):
+        t,w =  x.shape[:-3]
+        x = x.reshape(t*w,*x.shape[-3:])
+        x = self.encoder(x)
+        x = x.reshape(t,w,*x.shape[1:])
+        return x
+    
+    def single(self,x:T.Tensor,ht:T.Tensor,ct:T.Tensor):
+        ht,ct = self.lstm(x,(ht,ct))
+        v = self.v_head(ht)
+        logits:T.Tensor = self.pi_head(ht)
+        probs = logits.softmax(dim=-1)
+        return probs,v,ht,ct
+
+    def stateless_forward(self,obs:T.Tensor):
+        n = obs.size(1)
+        ht,ct = self.get_initials(n)
+        return self.predict(obs,(ht,ct))
+    
+    def predict(self,obs:T.Tensor,ht:T.Tensor,ct:T.Tensor)->tuple[T.Tensor,T.Tensor,T.Tensor,T.Tensor]:
+        return self(obs,(ht,ct))
+
+class SmallRnnActorCriticNetwork(PytorchNetwork):
+    def __init__(self,observation_shape:tuple,n_actions:int) -> None:
+        super().__init__()
+        self.lstmout = 256
+        self.encoder = nn.Sequential(
+            # (?,4,84,84)
+            nn.Conv2d(observation_shape[0], 32, 8, 4),
+            # (?,32,20,20)
             nn.ReLU(),
+            nn.Conv2d(32, 64, 4, 2),
+            # (?,64,9,9)
+            nn.ReLU(),
+            nn.Conv2d(64, 64, 3, 1),
+            # (?,64,7,7)
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        self.lstm = nn.LSTMCell(64*7*7,self.lstmout)
+        self.pi_head = nn.Sequential(
+            nn.Linear(self.lstmout,n_actions),
+        )
+        self.v_head = nn.Sequential(
             nn.Linear(self.lstmout,1)
         )
 

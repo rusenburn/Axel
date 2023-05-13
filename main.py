@@ -13,6 +13,10 @@ from axel.trainer_builder import TrainerBuilder
 def get_env():
     return apply_wrappers(env=gym.make(id="ALE/Riverraid-v5"))
 
+def get_env_fn(env_name:str,skip=4,grayscale=True,resize=84,framestack=1,reward_scale=1/100):
+    def custom_env():
+        return apply_wrappers(env=gym.make(id=env_name),skip=skip,grayscale=grayscale,resize=resize,framestack=framestack,reward_scale=reward_scale)
+    return custom_env
 
 def get_cartpole():
     return gym.make("CartPole-v1")
@@ -147,8 +151,8 @@ def train_pop3d_cartpole():
 
 
 def train_recurrent_ppo():
-    envs_fns = [get_env for _ in range(8)]
-    ppo = RecurrentPPO(game_fns=envs_fns)
+    envs_fns = [get_env_fn("ALE/Riverraid-v5",reward_scale=1/100,framestack=1) for _ in range(8)]
+    ppo = RecurrentPPO(total_steps=8_000_000,game_fns=envs_fns,gamma=0.99,normalize_adv=False,decay_lr=False)
     ppo.run()
 def main():
     # train_pop3d()

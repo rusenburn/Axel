@@ -1,6 +1,8 @@
 import gym
 from gym import Env
+from gym.core import Env
 from gym.wrappers.frame_stack import FrameStack
+from gym.wrappers.atari_preprocessing import AtariPreprocessing
 from gym import spaces
 import numpy as np
 import torch as T
@@ -22,7 +24,7 @@ class SkipFrame(gym.Wrapper):
             total_reward += reward
             if done:
                 break
-        return obs, total_reward/100, done, trunk, info
+        return obs, total_reward, done, trunk, info
 
 
 class GrayScaleObservation(gym.ObservationWrapper):
@@ -63,13 +65,52 @@ class ResizeObservation(gym.ObservationWrapper):
         arr:np.ndarray =observation.numpy()
         return arr
 
+class Obser(gym.ObservationWrapper):
+    def __init__(self, env: Env):
+        super().__init__(env)
+        assert isinstance(self.observation_space, spaces.Box)
+        low , high = self.observation_space.low , self.observation_space.high
+        shape = self.observation_space.shape
+        self.observation_space = spaces.Box(low=low,high=high,shape=shape,dtype=np.int32)
+        
+    def observation(self, observation):
+        observation = self.permute_orientation(observation)
+        return observation
 
-def apply_wrappers(env):
-    env = SkipFrame(env, skip=4)
-    env = GrayScaleObservation(env)
-    env = ResizeObservation(env, shape=84)
+    def permute_orientation(self, observation):
+        # permute [H, W, C] array to [C, H, W] tensor
+        observation = np.transpose(observation, (2, 0, 1)).copy()
+        # observation = T.tensor(observation.copy(), dtype=T.float)
+        return observation
+
+class RewardScale(gym.RewardWrapper):
+    def __init__(self, env,scale = 1/100):
+        super().__init__(env)
+        self.scale = scale
+    
+    def reward(self, reward):
+        return reward * self.scale
+def apply_wrappers(env,skip=4,grayscale=True,resize=84,framestack = 1,reward_scale=1/100):
+    env = SkipFrame(env, skip=skip)
+    env = RewardScale(env,reward_scale)
+    if grayscale:
+        env = GrayScaleObservation(env)
+    env = ResizeObservation(env, shape=resize)
     if gym.__version__ < "0.26":
-        env = FrameStack(env, num_stack=4, new_step_api=True)
+        env = FrameStack(env, num_stack=framestack, new_step_api=True)
     else:
-        env = FrameStack(env, num_stack=4)
+        env = FrameStack(env, num_stack=framestack)
     return env
+
+# def apply_wrappers(env,skip=4,grayscale=True,resize=84,framestack=1,reward_scale=1/100):
+#     env = SkipFrame(env=env,skip=skip)
+#     env = RewardScale(env,reward_scale)
+#     if grayscale:
+#         env = GrayScaleObservation(env)
+#     env = Obser(env)
+#     # env = AtariPreprocessing(env,frame_skip=1,screen_size=resize,grayscale_obs=True,scale_obs=True,terminal_on_life_loss=True)
+#     if gym.__version__ < "0.26":
+#         env = FrameStack(env, num_stack=framestack, new_step_api=True)
+#     else:
+#         env = FrameStack(env, num_stack=framestack)
+#     return env
