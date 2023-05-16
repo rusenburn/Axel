@@ -152,7 +152,7 @@ class RecurrentPPO():
             all_cts_t = T.stack(all_cts,dim=0)
 
             if self.normalize_rewards:
-                rewards , scaler = self.reward_normalizer.normalize_rewards(all_rewards_ar,all_terminals_ar,self.max_reward_norm)
+                all_rewards_ar , scaler = self.reward_normalizer.normalize_rewards(all_rewards_ar,all_terminals_ar,self.max_reward_norm)
             
             all_adv_ar , all_returns_ar = self.calculate_adv(all_rewards_ar,all_values_ar,all_terminals_ar,last_values_ar)
 
@@ -163,7 +163,6 @@ class RecurrentPPO():
                 lr = self.lr * decay
                 for g in self.optim.param_groups:
                     g['lr'] = lr
-                self.optim.param_groups
             total_loss , actor_loss , critic_loss , entropy ,approx_kl= self.train_network(
                 all_states_ar,all_actions_ar,all_probs_ar,all_adv_ar,all_returns_ar,all_terminals_ar,all_hts_t,all_cts_t)
             

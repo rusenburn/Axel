@@ -2,6 +2,7 @@ import gym
 from gym.vector import SyncVectorEnv, AsyncVectorEnv
 import numpy as np
 import time
+from axel.a2c.a2c import A2C
 from axel.ppo.ppo import Ppo
 from axel.pop3d.pop3d import Pop3d
 from axel.ppg.ppg import Ppg
@@ -73,6 +74,11 @@ def train_ppg():
     ppg.run()
     vec_env.close()
 
+
+def train_a2c():
+    env_fns = [get_env for _ in range(8)]
+    a2c = A2C(env_fns)
+    a2c.run()
 
 def train_ppg_cartpole():
     env_fns = [get_cartpole for _ in range(8)]
@@ -151,12 +157,13 @@ def train_pop3d_cartpole():
 
 
 def train_recurrent_ppo():
-    envs_fns = [get_env_fn("ALE/Riverraid-v5",reward_scale=1/100,framestack=1) for _ in range(8)]
+    envs_fns = [get_env_fn("ALE/Riverraid-v5",reward_scale=1,framestack=1) for _ in range(8)]
     ppo = RecurrentPPO(total_steps=8_000_000,game_fns=envs_fns,gamma=0.99,normalize_adv=False,decay_lr=False)
     ppo.run()
 def main():
     # train_pop3d()
     train_recurrent_ppo()
+    # train_a2c()
     # train_ppg()
     # train_ppo()
     # train_ppg_cartpole()

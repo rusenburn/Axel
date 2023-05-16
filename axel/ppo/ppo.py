@@ -59,7 +59,6 @@ class Ppo:
         # Improvements
         self.max_grad_norm = max_grad_norm
         self.normalize_adv = normalize_adv
-        self.max_grad_norm = 0.5
         self.normalize_rewards = normalize_rewards
         self.max_reward_norm = max_reward_norm
         self.reward_normalizer = RunningNormalizer(maxlen=100,gamma=gamma)
@@ -217,7 +216,6 @@ class Ppo:
         
         if self.normalize_rewards:
             reward_samples , self.scaler = self.reward_normalizer.normalize_rewards(reward_samples,terminal_samples,self.max_reward_norm)
-            # reward_samples = self._normalize_rewards(reward_samples,self.max_reward_norm)
 
         advantages_arr , returns_arr = self._calc_adv(reward_samples,value_samples,terminal_samples,last_values)
 

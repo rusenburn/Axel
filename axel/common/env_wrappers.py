@@ -3,6 +3,7 @@ from gym import Env
 from gym.core import Env
 from gym.wrappers.frame_stack import FrameStack
 from gym.wrappers.atari_preprocessing import AtariPreprocessing
+from gym.wrappers.record_episode_statistics import RecordEpisodeStatistics
 from gym import spaces
 import numpy as np
 import torch as T
@@ -92,6 +93,7 @@ class RewardScale(gym.RewardWrapper):
         return reward * self.scale
 def apply_wrappers(env,skip=4,grayscale=True,resize=84,framestack = 1,reward_scale=1/100):
     env = SkipFrame(env, skip=skip)
+    env = RecordEpisodeStatistics(env,100)
     env = RewardScale(env,reward_scale)
     if grayscale:
         env = GrayScaleObservation(env)
@@ -100,6 +102,7 @@ def apply_wrappers(env,skip=4,grayscale=True,resize=84,framestack = 1,reward_sca
         env = FrameStack(env, num_stack=framestack, new_step_api=True)
     else:
         env = FrameStack(env, num_stack=framestack)
+    
     return env
 
 # def apply_wrappers(env,skip=4,grayscale=True,resize=84,framestack=1,reward_scale=1/100):
