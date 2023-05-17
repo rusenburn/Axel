@@ -89,7 +89,7 @@ class A2C():
 
         while current_step < self.total_steps:
             # run 1 training
-            all_log_probs : list[np.ndarray] = []
+            # all_log_probs : list[np.ndarray] = []
             all_actions : list[np.ndarray] = []
             all_observations : list[np.ndarray] = []
             all_rewards :list[np.ndarray] = []
@@ -103,7 +103,7 @@ class A2C():
                     values_t = self.critic.evaluate(observations_t)
                 dist = T.distributions.Categorical(probs)
                 actions_t = dist.sample()
-                action_log_probs = dist.log_prob(actions_t)
+                # action_log_probs = dist.log_prob(actions_t)
                 actions = actions_t.cpu().numpy()
 
                 new_obs, rewards,terminals,truncs,infos = self.vec_env.step(actions)
@@ -118,7 +118,7 @@ class A2C():
                 terminals = np.logical_or(terminals,truncs)
                 all_observations.append(observations)
                 all_actions.append(actions)
-                all_log_probs.append(action_log_probs)
+                # all_log_probs.append(action_log_probs)
                 all_rewards.append(rewards)
                 all_terminals.append(terminals)
                 all_values.append(values_t.squeeze().cpu().numpy())
