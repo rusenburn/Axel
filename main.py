@@ -7,13 +7,15 @@ from axel.impala.impala import Impala
 from axel.ppo.ppo import Ppo
 from axel.pop3d.pop3d import Pop3d
 from axel.ppg.ppg import Ppg
-from axel.common.env_wrappers import apply_wrappers
+from axel.common.env_wrappers import apply_wrappers,apply_wrappers_2
 from axel.ppo.recurrent_ppo import RecurrentPPO
 from axel.trainer_builder import TrainerBuilder
+from axel.dddq.dddq import DDDQ
 
 
 def get_env():
-    return apply_wrappers(env=gym.make(id="ALE/Riverraid-v5"))
+    # return apply_wrappers(env=gym.make(id="ALE/Riverraid-v5"))
+    return apply_wrappers(env=gym.make("CarRacing-v2", continuous=False))
 
 def get_env_fn(env_name:str,skip=4,grayscale=True,resize=84,framestack=1,reward_scale=1/100):
     def custom_env():
@@ -166,10 +168,17 @@ def train_recurrent_ppo():
     envs_fns = [get_env_fn("ALE/Riverraid-v5",reward_scale=1/100,framestack=1) for _ in range(8)]
     ppo = RecurrentPPO(total_steps=8_000_000,game_fns=envs_fns,gamma=0.99,normalize_adv=False,decay_lr=False)
     ppo.run()
+
+def train_dddq():
+    def env_fn():
+        return apply_wrappers_2(gym.make(id="ALE/Riverraid-v5"),framestack=4)
+    
+    dddq = DDDQ(env_fns= [env_fn for _ in range(8)],name="RiverFrameStack4")
+    dddq.run()
 def main():
     # train_pop3d()
     # train_recurrent_ppo()
-    train_impala()
+    # train_impala()
     # train_a2c()
     # train_ppg()
     # train_ppo()
@@ -177,6 +186,7 @@ def main():
     # train_ppg_acrobat()
     # train_ppo_catrpole()
     # train_pop3d_cartpole()
+    train_dddq()
 
 
 if __name__ == "__main__":

@@ -70,7 +70,7 @@ class Ppo:
         if len(self.observation_shape)>2:
             if residual:
                 self.actor : ActorNetwork = ImpalaActorCritic(self.vec_env.single_observation_space.shape,self.n_game_actions)
-                self.critic : CriticNetwork = ImpalaCritic(self.vec_env.single_observation_space.shape,self.n_game_actions)
+                self.critic : CriticNetwork = ImpalaCritic(self.vec_env.single_observation_space.shape)
             else:
                 self.actor : ActorNetwork = CnnActorNetwork(
                     self.vec_env.single_observation_space.shape, self.n_game_actions)

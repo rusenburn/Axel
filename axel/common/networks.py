@@ -73,7 +73,12 @@ class ActorCriticNetwork(ActorNetwork,CriticNetwork):
     def act_and_eval(self,observation:T.Tensor)->tuple[T.Tensor,T.Tensor]:
         raise NotImplementedError()
 
-
+class StateActionNetwork(PytorchNetwork):
+    def __init__(self) -> None:
+        super().__init__()
+    
+    def evaluate(self,observation:T.Tensor)->T.Tensor:
+        raise NotImplementedError()
 
 class CnnActorNetwork(ActorNetwork):
     def __init__(self, observation_space: np.ndarray, n_actions: int) -> None:
@@ -554,3 +559,46 @@ class SmallRnnActorCriticNetwork(PytorchNetwork):
     
     def predict(self,obs:T.Tensor,ht:T.Tensor,ct:T.Tensor)->tuple[T.Tensor,T.Tensor,T.Tensor,T.Tensor]:
         return self(obs,(ht,ct))
+
+
+class SmallDuelingQNetwork(StateActionNetwork):
+    def __init__(self , observation_shape:tuple,n_actions:int) -> None:
+        super().__init__()
+    def evaluate(self, observation: T.Tensor)->T.Tensor:
+        return self(observation)
+    def forward(self,observation:T.Tensor):
+        raise NotImplementedError()
+
+class DuelingQNetwork(StateActionNetwork):
+    def __init__(self,observation_shape:tuple,n_actions:int) -> None:
+        super().__init__()
+        self._shared = nn.Sequential(
+            # (?,4,84,84)
+            nn.Conv2d(observation_shape[0], 32, 8, 4),
+            # (?,32,20,20)
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 4, 2),
+            # (?,64,9,9)
+            nn.ReLU(),
+            nn.Conv2d(64, 64, 3, 1),
+            # (?,64,7,7)
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(64*7*7, 512),
+            nn.ReLU()
+            )
+        self._advantages = nn.Linear(512,n_actions)
+        self._value = nn.Linear(512,1)
+
+    
+    def evaluate(self, observation: T.Tensor)->T.Tensor:
+        return self(observation)
+    
+    def forward(self,observation:T.Tensor):
+        shared :T.Tensor = self._shared(observation)
+
+        advs : T.Tensor = self._advantages(shared)
+        advs = advs - advs.mean(dim=-1,keepdim=True)
+        value = self._value(shared)
+        qsa = advs + value
+        return qsa

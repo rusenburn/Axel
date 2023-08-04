@@ -38,7 +38,7 @@ class GrayScaleObservation(gym.ObservationWrapper):
     def permute_orientation(self, observation):
         # permute [H, W, C] array to [C, H, W] tensor
         observation = np.transpose(observation, (2, 0, 1))
-        observation = T.tensor(observation.copy(), dtype=T.float)
+        observation = T.tensor(observation.copy(), dtype=T.uint8)
         return observation
 
     def observation(self, observation):
@@ -65,6 +65,28 @@ class ResizeObservation(gym.ObservationWrapper):
         observation:T.Tensor = transform(observation).squeeze(0)
         arr:np.ndarray =observation.numpy()
         return arr
+
+
+
+class ResizeObservationOnly(gym.ObservationWrapper):
+    def __init__(self, env: Env, shape):
+        super().__init__(env)
+        if isinstance(shape, int):
+            self.shape = (shape, shape)
+        else:
+            self.shape = tuple(shape)
+
+        obs_shape = self.shape + self.observation_space.shape[2:]
+        self.observation_space.dtype
+        self.observation_space = spaces.Box(
+            low=0, high=255, shape=obs_shape, dtype=self.observation_space.dtype)
+
+    def observation(self, observation):
+        transform = TR.Compose([TR.Resize(self.shape)])
+        observation:T.Tensor = transform(observation).squeeze(0)
+        arr:np.ndarray =observation.numpy()
+        return arr
+    
 
 class Obser(gym.ObservationWrapper):
     def __init__(self, env: Env):
@@ -105,6 +127,21 @@ def apply_wrappers(env,skip=4,grayscale=True,resize=84,framestack = 1,reward_sca
     
     return env
 
+
+
+def apply_wrappers_2(env,skip=4,grayscale=True,resize=84,framestack = 1,reward_scale=1/100):
+    env = SkipFrame(env, skip=skip)
+    env = RecordEpisodeStatistics(env,100)
+    env = RewardScale(env,reward_scale)
+    if grayscale:
+        env = GrayScaleObservation(env)
+    env = ResizeObservationOnly(env, shape=resize)
+    if gym.__version__ < "0.26":
+        env = FrameStack(env, num_stack=framestack, new_step_api=True)
+    else:
+        env = FrameStack(env, num_stack=framestack)
+    
+    return env
 # def apply_wrappers(env,skip=4,grayscale=True,resize=84,framestack=1,reward_scale=1/100):
 #     env = SkipFrame(env=env,skip=skip)
 #     env = RewardScale(env,reward_scale)
